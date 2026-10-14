@@ -1,38 +1,19 @@
 # PKU-Replay-Saver
 
-Download a complete lecture or its first five minutes, with a progress bar directly
-below the video. Saves standard MP4 for Safari/QuickTime and Chrome/Edge, or original
-TS. Uses your current login; no FFmpeg, Python, WASM, or server is needed.
+使用当前登录态下载北大录播，默认保存普通 MP4，也可选择 fMP4 或 TS。无需安装 FFmpeg、Python 或 WASM。
 
-## Install
+1. 安装 **Tampermonkey**，导入 `PKU-Replay-Saver.user.js`，或在 GitHub 打开脚本后点击 **Raw** 安装。
+2. 打开已登录的教学网录播页面，先播放视频。
+3. 点击「下载前 5 分钟测试」检查画面和声音，或点击「下载完整视频」。测试片段按分片边界截取，可能略长于 5 分钟。
 
-1. Install **Tampermonkey** in your browser.
-2. Open **PKU-Replay-Saver.user.js** on GitHub and click **Raw** to install it.
-   Alternatively, import the downloaded file through Tampermonkey's dashboard,
-   or paste its contents into a new script and save.
-3. Reload your logged-in video page and start playback.
+脚本匹配 `https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/` 下的页面及嵌套录播播放器。中文面板放在滚动容器外的下方，显示进度、速度、剩余时间和错误信息；可取消、重新下载、复制地址和按课程名重命名。Chrome / Edge 若脚本未运行，请在扩展设置中启用「允许用户脚本」。
 
-When updating an existing installation manually, replace that script's contents.
-If scripts don't run in Chrome/Edge, enable **Allow user scripts** in Tampermonkey's
-extension settings.
+保持页面打开直到完成。Chrome / Edge 可选择保存位置；其他环境使用浏览器临时磁盘，完成后自动交给下载管理器，临时副本在 5 分钟后清理。地址未检测到时，在「播放地址设置」中填入 `.m3u8` 地址。
 
-## Download
+普通 MP4 包含完整索引，兼容性较好，索引和转封装缓冲区会增加内存开销；fMP4 文件名带 `-fMP4` 标记，个人测试可能无法在 QuickTime Player 正常播放；TS 建议使用 IINA / VLC。三种格式都不重新编码。
 
-Click **Download first 5 minutes** to check picture and sound, or **Download full
-video** to save the entire recording. The test clip ends at an HLS segment boundary,
-so it can be a few seconds longer than five minutes.
+下载中断会撤销写入、回收临时文件，不把未完成的视频当作成品保存。清理失败会保留记录并在页面恢复后重试，浏览器强杀后需要下次打开页面且存储可用才能回收。重新下载从头开始，暂不支持断点续传。已缺失的媒体内容无法靠重新封装补回；保存对话框创建的空文件或撤销失败的目标可能需要手动检查。
 
-Keep the page open until completion. If **Save finished video** appears, click it to
-save the completed file. **Cancel** stops the download.
+仅支持完整、音视频合并的 HLS，不支持直播、DRM 或音视频分离。普通 MP4 和两小时实媒体已通过结构、音视频解码检查；更新后的教学网布局仍需实机验证。
 
-If the stream isn't detected, open **Stream settings** and paste its `.m3u8` URL
-from browser DevTools. Complete, combined audio/video HLS recordings are supported;
-live streams, DRM, and separate audio playlists are unsupported.
-
-## Credits
-
-Includes [mux.js](https://github.com/videojs/mux.js) 6.3.0 (Apache-2.0) and
-[Mediabunny](https://github.com/Vanilagy/mediabunny) 1.61.4 (MPL-2.0).
-The downloader's own code is MIT licensed. Full terms are in `LICENSE` and
-`THIRD-PARTY-LICENSES.txt`.
-# PKU-Replay-Saver
+自有代码为 MIT，包含 mux.js 6.3.0（Apache-2.0）。完整许可见 `LICENSE` 与 `THIRD-PARTY-LICENSES.txt`。
