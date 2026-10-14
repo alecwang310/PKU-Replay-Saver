@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Replay-Saver
 // @namespace    pku-replay-saver
-// @version      1.5.5
+// @version      1.5.6
 // @description  使用当前登录态下载北大录播，支持普通 MP4、fMP4 和 TS，可另存 MP3 / AAC 音频，显示进度与剩余时间。
 // @match        https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/*
 // @match        https://onlineroomse.pku.edu.cn/player*
@@ -1684,7 +1684,7 @@ return module.exports; })();
 
   function sendSources() {
     for (const url of discovered.keys()) {
-      window.top.postMessage({ type: bridgeType, url, headers: observedHeaders.get(new URL(url).origin) || {}, referrer: location.href, title: document.querySelector('.course-info__header')?.textContent || document.title }, courseOrigin);
+      window.top.postMessage({ type: bridgeType, url, headers: observedHeaders.get(new URL(url).origin) || {}, referrer: location.href, title: document.title || document.querySelector('.course-info__header')?.textContent }, courseOrigin);
     }
   }
   window.addEventListener('message', event => {
@@ -1917,7 +1917,7 @@ return module.exports; })();
       <p class="status" aria-live="polite">请先播放视频，检测到地址后即可下载。</p>
       <p class="metrics">0 MB · 速度 — · 剩余时间 —</p>
       <p class="notice">MP4 兼容性较好；TS / fMP4 在 QuickTime 等播放器中可能无法正常播放。下载过程中请保持页面打开。</p>
-      <div class="toolbar" style="margin:10px 0 0"><button class="copy secondary">复制播放地址</button><label style="margin:0"><input class="rename" type="checkbox" checked style="width:auto;margin:0"> 使用课程名重命名</label></div>
+      <div class="toolbar" style="margin:10px 0 0"><button class="copy secondary">复制播放地址</button><label style="margin:0"><input class="rename" type="checkbox" checked style="width:auto;margin:0"> 使用课程信息命名</label></div>
       <div class="audio-tools toolbar" hidden style="margin:10px 0 0">
         <button class="audio">保存音频</button>
         <select class="audioformat" aria-label="音频格式"><option value="mp3">MP3（兼容性更好）</option><option value="aac">AAC（无需重新编码）</option></select>
@@ -2000,8 +2000,8 @@ return module.exports; })();
     try { url = Core.networkURL(panel.url.value.trim(), location.href); }
     catch (error) { panel.status.textContent = errorMessage(error); return; }
     const format = panel.format.value;
-    const title = (observedTitles.get(url) || document.querySelector('.course-info__header')?.textContent || document.title || '录播').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || '录播';
-    const filename = `${panel.rename.checked ? title : '录播'}${maxDuration ? '-前5分钟测试' : ''}${format === 'fmp4' ? '-fMP4' : ''}.${format === 'ts' ? 'ts' : 'mp4'}`;
+    const title = (observedTitles.get(url) || document.title || document.querySelector('.course-info__header')?.textContent || '录播').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || '录播';
+    const filename = `${panel.rename.checked ? title : '录播'}${maxDuration ? '-5min-test' : ''}${format === 'fmp4' ? '-fMP4' : ''}.${format === 'ts' ? 'ts' : 'mp4'}`;
     activeJob = new AbortController();
     const job = activeJob;
     let sink, wakeLock, committed = false, stopSink, handoffUrl;
@@ -2085,7 +2085,7 @@ return module.exports; })();
     const recordDiagnostic = value => {
       diagnostics.push(value);
       if (diagnostics.length > 100) diagnostics.splice(30, diagnostics.length - 100);
-      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.5.5-debug', events: diagnostics}, null, 2);
+      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.5.6-debug', events: diagnostics}, null, 2);
     };
     recordDiagnostic({stage: 'browser', userAgent: navigator.userAgent, selectedFormat: format,
       sandboxAudioDecoder: typeof globalThis.AudioDecoder, pageAudioDecoder: typeof page.AudioDecoder,
