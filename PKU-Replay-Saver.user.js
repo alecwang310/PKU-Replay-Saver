@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Replay-Saver
 // @namespace    pku-replay-saver
-// @version      1.5.6
+// @version      1.6.3
 // @description  使用当前登录态下载北大录播，支持普通 MP4、fMP4 和 TS，可另存 MP3 / AAC 音频，显示进度与剩余时间。
 // @match        https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/*
 // @match        https://onlineroomse.pku.edu.cn/player*
@@ -11,6 +11,7 @@
 // @grant        GM_registerMenuCommand
 // @connect      self
 // @connect      resourcese.pku.edu.cn
+// @connect      sourcese.pku.edu.cn
 // @license      MIT; mux.js 6.3.0 Apache-2.0; lamejs 1.2.1 LGPL-3.0
 // ==/UserScript==
 
@@ -475,12 +476,12 @@ function startHlsTempCleanup() {
     setInterval(recover, 60 * 1000);
 }
 
-async function createHlsOutput(fileName, format, signal, onHandoff) {
+async function createHlsOutput(fileName, format, signal, onHandoff, { browserDownload = false } = {}) {
     signal.throwIfAborted();
     // Call the picker on the real page window: the sandboxed `window` proxy fails
     // its brand check and throws "Illegal invocation".
     const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    if (page.top === page.self && typeof page.showSaveFilePicker === 'function') {
+    if (!browserDownload && page.top === page.self && typeof page.showSaveFilePicker === 'function') {
         const handle = await page.showSaveFilePicker({
             suggestedName: fileName,
             types: [{
@@ -584,6 +585,23 @@ async function createHlsOutput(fileName, format, signal, onHandoff) {
         return {
             type: 'browser-download',
             get fileAvailable() { return handedOff && !removed; },
+            holdHandoff() {
+                if (!handedOff || removed) throw new DOMException('视频临时副本已清理', 'NotFoundError');
+                readers++;
+                let released = false;
+                return async () => {
+                    if (released) return; released = true;
+                    try {
+                        // Give a completed batch the same five-minute re-save
+                        // window as a single download, without loading files.
+                        localStorage.setItem(RECORD_PREFIX + name, JSON.stringify({state: 'handoff', deleteAfter: Date.now() + HANDOFF_DELAY}));
+                        clearTimeout(cleanupTimer); cleanupDue = false;
+                        cleanupTimer = setTimeout(cleanupAfterHandoff, HANDOFF_DELAY);
+                    } finally {
+                        readers--; if (!readers && cleanupDue) await cleanupAfterHandoff();
+                    }
+                };
+            },
             async withFile(callback) {
                 if (!handedOff || removed) throw new DOMException('视频临时副本已清理', 'NotFoundError');
                 readers++;
@@ -1645,17 +1663,504 @@ const Core = (() => { const module = { exports: {} }; const exports = module.exp
 });
 
 return module.exports; })();
+const ListSource = (() => { const module = { exports: {} }; const exports = module.exports;
+/* Discover each recording through its existing authenticated watch page. */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.ReplayListSource = factory();
+})(globalThis, function () {
+  'use strict';
+  function create({document, location, validateURL, timeout = 45000}) {
+    let pending;
+    const trusted = new Set(['course.pku.edu.cn', 'yjapise.pku.edu.cn', 'onlineroomse.pku.edu.cn']);
+    function scan() {
+      if (!pending) return;
+      const visit = (frame, depth) => {
+        if (depth > 4) return;
+        let url;
+        try { url = new URL(frame.getAttribute('src') || frame.src, location.href); } catch { return; }
+        if (!trusted.has(url.hostname)) return;
+        const child = frame.contentWindow;
+        if (child) {
+          pending.windows.add(child);
+          try { child.postMessage({type: 'PKU_REPLAY_SAVER_SOURCE_V1_REQUEST', background: true}, 'https://onlineroomse.pku.edu.cn'); } catch {}
+        }
+        try { for (const nested of frame.contentDocument?.querySelectorAll('iframe') || []) visit(nested, depth + 1); } catch { /* Cross-origin player: the source window above is sufficient. */ }
+      };
+      visit(pending.frame, 0);
+    }
+    function accept(event) {
+      if (!pending || event.origin !== 'https://onlineroomse.pku.edu.cn' || event.data?.type !== 'PKU_REPLAY_SAVER_SOURCE_V1') return false;
+      scan();
+      if (!pending.windows.has(event.source)) return false;
+      try {
+        const url = validateURL(event.data.url, location.href);
+        const referrer = new URL(event.data.referrer || 'https://onlineroomse.pku.edu.cn/player');
+        if (referrer.origin !== event.origin) return false;
+        const headers = {};
+        new Headers(event.data.headers || {}).forEach((value, name) => { if (name === 'authorization' || name.startsWith('x-')) headers[name] = value; });
+        pending.finish(null, {url, kind: event.data.kind === 'mp4' ? 'mp4' : 'hls', referrer: referrer.href, origin: event.origin, headers,
+          title: typeof event.data.title === 'string' ? event.data.title.slice(0, 200) : ''});
+        return true;
+      } catch { return false; }
+    }
+    function resolve(entry, signal) {
+      signal.throwIfAborted();
+      if (pending) throw new Error('另一个录播正在获取播放地址。');
+      const watch = new URL(entry.watchURL, location.href);
+      if (watch.origin !== location.origin || !watch.pathname.endsWith('/playVideo.action')) throw new Error('录播观看入口无效。');
+      return new Promise((resolve, reject) => {
+        const frame = document.createElement('iframe');
+        frame.setAttribute('data-replay-source-frame', '');
+        frame.setAttribute('aria-hidden', 'true'); frame.tabIndex = -1;
+        // Keep a real browsing context so CAS and the player run their normal
+        // cookie-based login flow; never persist or manufacture credentials.
+        frame.style.cssText = 'position:fixed!important;left:-10000px!important;top:0!important;width:1px!important;height:1px!important;border:0!important;opacity:0!important;pointer-events:none!important;';
+        let timer, poll, settled = false;
+        const finish = (error, value) => {
+          if (settled) return; settled = true;
+          clearTimeout(timer); clearInterval(poll); signal.removeEventListener('abort', abort);
+          pending = null;
+          try { frame.src = 'about:blank'; frame.remove(); } catch { /* Detached by navigation. */ }
+          if (error) reject(error); else resolve(value);
+        };
+        const abort = () => finish(signal.reason || new DOMException('下载已取消', 'AbortError'));
+        pending = {frame, windows: new Set(), finish};
+        signal.addEventListener('abort', abort, {once: true});
+        frame.addEventListener('load', scan);
+        timer = setTimeout(() => finish(new Error('无法获取播放地址，请检查登录状态及脚本是否允许在嵌套播放器运行。')), timeout);
+        poll = setInterval(scan, 250);
+        try { frame.src = watch.href; document.body.appendChild(frame); scan(); }
+        catch (error) { finish(error); }
+        if (signal.aborted) abort();
+      });
+    }
+    return {resolve, accept};
+  }
+  return {create};
+});
+
+return module.exports; })();
+const ProgressEstimate = (() => { const module = { exports: {} }; const exports = module.exports;
+/* Time-based estimates shared by the player and recording-list interfaces. */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.ReplayProgressEstimate = factory();
+})(globalThis, function () {
+  'use strict';
+  const median = values => {
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
+  function createEstimate(now = () => performance.now()) {
+    let anchor, latest, started, speed, rate;
+    const samples = [];
+    return {
+      note(value, bytes = 0) {
+        if (!Number.isFinite(value) || !Number.isFinite(bytes) || value < 0 || bytes < 0) return;
+        const point = {time: now(), value: Math.min(1, value), bytes};
+        if (latest && (point.value < latest.value || point.bytes < latest.bytes || point.time < latest.time)) return;
+        if (latest && point.value === latest.value && point.bytes === latest.bytes) return;
+        // Discard the initial cached/prefetched burst. After a long stall,
+        // collect fresh evidence rather than reusing an obsolete fast rate.
+        if (!anchor || point.time - latest.time >= 10000) {
+          anchor = latest = point; started = point.time;
+          samples.length = 0; speed = rate = undefined; return;
+        }
+        latest = point;
+        const elapsed = (point.time - anchor.time) / 1000;
+        if (elapsed < 1) return; // Packet callbacks are not independent time samples.
+        samples.push({speed: (point.bytes - anchor.bytes) / elapsed, rate: (point.value - anchor.value) / elapsed});
+        if (samples.length > 5) samples.shift();
+        anchor = point;
+        if (point.time - started < 4000 || samples.length < 3) return;
+        const nextSpeed = median(samples.map(sample => sample.speed));
+        const nextRate = median(samples.map(sample => sample.rate));
+        const alpha = 1 - Math.exp(-elapsed / 4);
+        speed = speed === undefined ? nextSpeed : speed + alpha * (nextSpeed - speed);
+        rate = rate === undefined ? nextRate : rate + alpha * (nextRate - rate);
+      },
+      read() {
+        if (!latest) return {speed: null, remaining: Infinity};
+        const idle = Math.max(0, now() - latest.time);
+        if (latest.value >= 1) return {speed: speed ?? null, remaining: 0};
+        if (idle >= 10000) return {speed: 0, remaining: Infinity};
+        if (rate === undefined) return {speed: null, remaining: Infinity};
+        // Reads do not mutate the filter: rendering more often cannot change
+        // the estimate. During a pause, fade the speed instead of freezing it.
+        const decay = 1 / (1 + Math.max(0, idle - 2000) / 3000);
+        return {speed: speed * decay, remaining: rate > 0 ? (1 - latest.value) / (rate * decay) : Infinity};
+      },
+    };
+  }
+  return {createEstimate};
+});
+
+return module.exports; })();
+const ListPage = (() => { const module = { exports: {} }; const exports = module.exports;
+const require = name => { if (name === './progress-estimate.js') return ProgressEstimate; throw new Error('Unknown bundled dependency'); };
+/* Compact recording-list controls; one task at a time, bounded media memory. */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('./progress-estimate.js'));
+  else root.ReplayListPage = factory(root.ReplayProgressEstimate);
+})(globalThis, function (ProgressEstimate) {
+  'use strict';
+  const cleanName = value => String(value).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || '录播';
+  const {createEstimate} = ProgressEstimate;
+  function remainingText(seconds) {
+    if (!Number.isFinite(seconds)) return '剩余 —';
+    seconds = Math.max(0, Math.ceil(seconds));
+    if (seconds < 60) return `剩余 ${seconds} 秒`;
+    if (seconds < 3600) return `剩余 ${Math.floor(seconds/60)}分${seconds%60}秒`;
+    return `剩余 ${Math.floor(seconds/3600)}时${Math.floor(seconds%3600/60)}分`;
+  }
+  const css = `
+    :host{display:inline-block;color-scheme:light;font:13px/1.4 system-ui,sans-serif;vertical-align:middle}
+    [hidden]{display:none!important}*{box-sizing:border-box}.controls{display:grid;grid-template-columns:[primary] var(--primary-width,54px) [secondary] var(--secondary-width,94px) [warning] 14px;align-items:center;justify-content:start;column-gap:8px;height:34px}
+    .controls[data-metrics=true]{grid-template-columns:[metrics] 120px [primary] var(--primary-width,54px) [secondary] var(--secondary-width,94px) [warning] 14px}
+    .main,.ring{grid-column:primary;grid-row:1;justify-self:start}.audio,.cancel{grid-column:secondary;grid-row:1;justify-self:start}.warning{grid-column:warning;grid-row:1}
+    .metrics{grid-column:metrics;grid-row:1;font-size:11px;line-height:15px;color:#667085;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;visibility:hidden}
+    button,summary{font:inherit;cursor:pointer;border:1px solid #d6dde8;border-radius:7px;padding:5px 10px;background:#fff;color:#32445f;white-space:nowrap}
+    .main{background:#2563eb;color:white;border-color:#2563eb}button:hover,summary:hover{filter:brightness(.95)}button:disabled,summary[aria-disabled=true]{opacity:.45;cursor:default}
+    .cancel{font-size:12px;padding:3px 7px;color:#a33838}details{position:relative}summary{list-style:none}summary::-webkit-details-marker{display:none}summary::after{content:' ▾';font-size:10px}
+    .menu{position:absolute;right:0;top:calc(100% + 4px);z-index:100;min-width:110px;padding:4px;background:white;border:1px solid #d6dde8;border-radius:8px;box-shadow:0 4px 16px #0002}
+    .menu button{display:block;width:100%;text-align:left;border:0}.ring{position:relative;width:34px;height:34px;flex:0 0 34px}.ring svg{width:34px;height:34px;transform:rotate(-90deg)}
+    circle{fill:none;stroke-width:3}.track{stroke:#e4eaf4}.fill{stroke:#2563eb;stroke-linecap:round;stroke-dasharray:100;transition:stroke-dashoffset .15s}.percent{position:absolute;inset:0;display:grid;place-items:center;font-size:9px;color:#32445f}
+    .ring[data-pending=true] .fill{stroke-dasharray:22 78;animation:spin 1s linear infinite;transform-origin:17px 17px}@keyframes spin{to{transform:rotate(360deg)}}
+    .warning{color:#ae3636;font-weight:600;font-size:15px}.message{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+  `;
+  function create({document, location, Core, FileOutput, AudioExport, AudioReader, muxjs, mp4Writer, encoderFactory,
+    resolveSource, request, errorMessage, onJob = () => {}}) {
+    const entries = new Map(), controls = new Set();
+    let active, bottom, table, layoutObserver, observedContainer;
+    const available = entry => Boolean(entry.localFile || (!entry.needsFile && entry.video?.sink.fileAvailable));
+    function message(control, text, error = false) {
+      control.message.textContent = text; control.warning.hidden = !error; control.warning.title = text;
+      control.progressText = text;
+      control.ring.title = text; control.host.title = error ? text : '';
+    }
+    function progress(control, value, text) {
+      control.ring.dataset.pending = String(value === null);
+      const percent = Math.round(Math.max(0, Math.min(1, value || 0)) * 100);
+      control.fill.style.strokeDashoffset = String(100 - percent);
+      control.percent.textContent = value === null ? '' : `${percent}%`;
+      control.ring.setAttribute('aria-valuenow', String(percent));
+      if (text) { control.progressText = text; control.ring.title = text; control.message.textContent = text; }
+    }
+    function estimate(control, value) {
+      control.speed.textContent = value.speed === null ? '— MB/s' : `${(value.speed/1048576).toFixed(1)} MB/s`;
+      control.remaining.textContent = remainingText(value.remaining);
+      control.metrics.title = `${control.speed.textContent} · ${control.remaining.textContent}`;
+      control.ring.title = `${control.progressText || ''} · ${control.metrics.title}`;
+    }
+    function render(control) {
+      const busy = active && (active.control === control || active.current?.control === control || (control.batch && !active.control.host.isConnected));
+      const done = control.batch ? control.complete : Boolean(control.entry.video);
+      control.main.hidden = Boolean(busy); control.ring.hidden = !busy; control.cancel.hidden = !busy;
+      control.audio.hidden = !done || Boolean(busy);
+      control.metrics.style.visibility = busy ? 'visible' : 'hidden';
+      control.main.textContent = done ? (control.batch ? '重存全部' : '重存') : (control.batch ? '下载全部' : '下载');
+      control.main.title = done ? '重新保存已完成的视频' : '保存完整 MP4';
+      control.main.disabled = Boolean(active); control.summary.setAttribute('aria-disabled', String(Boolean(active)));
+      for (const button of control.audio.querySelectorAll('button')) button.disabled = Boolean(active);
+      control.cancel.disabled = Boolean(busy && active.cancelling);
+      control.cancel.textContent = busy && active.cancelling ? '取消中' : '取消';
+    }
+    function renderAll() { for (const control of controls) render(control); }
+    function positionMenu(control) {
+      if (!control.audio.open || !control.summary.getBoundingClientRect) return;
+      const rect = control.summary.getBoundingClientRect(), viewport = document.documentElement.clientWidth || 1024;
+      const menu = control.audio.querySelector('.menu'), height = menu.getBoundingClientRect().height || 76;
+      menu.style.position = 'fixed'; menu.style.right = 'auto';
+      menu.style.left = `${Math.max(8, Math.min(rect.right - 110, viewport - 118))}px`;
+      menu.style.top = `${Math.max(8, rect.bottom + height + 8 > (document.documentElement.clientHeight || 768) ? rect.top - height - 4 : rect.bottom + 4)}px`;
+    }
+    function makeControl(parent, entry, batch = false) {
+      const host = document.createElement('span'); host.setAttribute('data-replay-list-control', batch ? 'all' : 'row');
+      const shadow = host.attachShadow({mode: 'closed'}), style = document.createElement('style'); style.textContent = css; shadow.append(style);
+      const wrap = document.createElement('div'); wrap.className = 'controls';
+      wrap.innerHTML = `<span class="metrics" hidden><span class="speed">— MB/s</span><br><span class="remaining">剩余 —</span></span>
+        <button class="main" type="button">${batch ? '下载全部' : '下载'}</button>
+        <span class="ring" hidden role="progressbar" aria-label="${batch ? '全部录播进度' : '录播进度'}" aria-valuemin="0" aria-valuemax="100"><svg viewBox="0 0 34 34" aria-hidden="true"><circle class="track" cx="17" cy="17" r="12"/><circle class="fill" cx="17" cy="17" r="12" pathLength="100"/></svg><span class="percent"></span></span>
+        <details class="audio" hidden><summary>${batch ? '提取全部音频' : '提取音频'}</summary><div class="menu"><button type="button" data-format="aac" title="保留原始 AAC，无需重新编码">AAC</button><button type="button" data-format="mp3" title="重新编码为 MP3，兼容性更好">MP3</button></div></details>
+        <button class="cancel" type="button" hidden>取消</button><span class="warning" hidden aria-label="任务失败">!</span><span class="message" role="status" aria-live="polite"></span>`;
+      shadow.append(wrap); parent.append(host);
+      const control = {host, wrap, batch, entry, complete: false};
+      for (const name of ['main','ring','fill','percent','audio','cancel','warning','message','metrics','speed','remaining']) control[name] = shadow.querySelector(`.${name}`);
+      if (batch) { host.style.setProperty('--primary-width', '90px'); host.style.setProperty('--secondary-width', '130px'); }
+      control.summary = shadow.querySelector('summary');
+      control.audio.addEventListener('toggle', () => positionMenu(control));
+      control.main.onclick = () => start(control, (batch ? control.complete : entry.video) ? 'resave' : 'video');
+      control.summary.onclick = event => { if (active) event.preventDefault(); };
+      for (const button of control.audio.querySelectorAll('button')) button.onclick = () => { control.audio.open = false; start(control, button.dataset.format); };
+      control.cancel.onclick = () => { if (active) { active.cancelling = true; active.controller.abort(); renderAll(); } };
+      controls.add(control); render(control); return control;
+    }
+    function rowTitle(row) {
+      const course = document.title.replace(/^.*?[–—]\s*/, '').replace(/[（(][^()（）]*学期[^()（）]*[）)]\s*$/, '').trim();
+      return cleanName(`${course}${row.querySelector('th[scope="row"]')?.textContent.trim() || ''}`);
+    }
+    function reserveLayout() {
+      if (!table) return;
+      const container = table.parentElement;
+      const availableWidth = container.clientWidth || container.getBoundingClientRect?.().width || 0;
+      let measurement;
+      try { measurement = document.createElement('canvas').getContext?.('2d'); } catch {}
+      const rows = [...table.querySelectorAll('tr')]; let contentWidth = 0;
+      const originalCount = table.querySelector('thead tr')?.querySelectorAll('th:not([data-replay-list-heading])').length || 4;
+      for (let column = 0; column < originalCount; column++) {
+        let required = 0;
+        for (const row of rows) {
+          const cell = row.children[column]; if (!cell) continue;
+          const text = (cell.querySelector('.table-data-cell-value') || cell).textContent.replace(/\s+/g, ' ').trim();
+          const style = document.defaultView?.getComputedStyle?.(cell);
+          let width = 0;
+          if (measurement) { measurement.font = style?.font || '13px system-ui'; width = measurement.measureText(text).width; }
+          else for (const char of text) width += char.charCodeAt(0) > 255 ? 13 : 7;
+          required = Math.max(required, width + (parseFloat(style?.paddingLeft) || 10) + (parseFloat(style?.paddingRight) || 10) + 16);
+        }
+        contentWidth += required;
+      }
+      // Decide from the table's content and containing width, never from an
+      // active button's size. All row states use the same reserved grid tracks.
+      const showMetrics = availableWidth - contentWidth >= 326;
+      for (const entry of entries.values()) {
+        entry.control.wrap.dataset.metrics = String(showMetrics);
+        entry.control.metrics.hidden = !showMetrics;
+        entry.control.host.style.width = `${showMetrics ? 306 : 178}px`;
+        const cell = entry.control.host.parentElement;
+        cell.style.width = cell.style.minWidth = `${(showMetrics ? 306 : 178) + 20}px`;
+      }
+      const heading = table.querySelector('[data-replay-list-heading]');
+      if (heading) {
+        heading.style.cssText = `box-sizing:border-box;text-align:left;padding:8px 10px;width:${showMetrics ? 326 : 198}px;`;
+        heading.style.paddingLeft = `${showMetrics ? 138 : 10}px`;
+      }
+      if (bottom) {
+        const wide = (bottom.host.parentElement.clientWidth || availableWidth) >= 398;
+        bottom.wrap.dataset.metrics = String(wide); bottom.metrics.hidden = !wide;
+        bottom.host.style.width = `${wide ? 378 : 250}px`;
+      }
+      const ResizeObserver = document.defaultView?.ResizeObserver || globalThis.ResizeObserver;
+      if (ResizeObserver && observedContainer !== container) {
+        layoutObserver?.disconnect(); observedContainer = container;
+        layoutObserver = new ResizeObserver(() => reserveLayout()); layoutObserver.observe(container);
+      }
+    }
+    function refresh() {
+      table = document.querySelector('#listContainer_datatable');
+      if (!table) return;
+      for (const row of table.querySelectorAll('tbody tr')) {
+        const link = row.querySelector('a[href*="playVideo.action"]'); if (!link) continue;
+        const watch = new URL(link.getAttribute('href'), location.href);
+        if (watch.origin !== location.origin || !watch.pathname.endsWith('/playVideo.action')) continue;
+        const previous = [...entries.values()].find(entry => entry.row === row && entry.control.host.isConnected);
+        if (previous) {
+          if (previous.watchURL !== watch.href) { entries.delete(previous.watchURL); previous.watchURL = watch.href; entries.set(watch.href, previous); }
+          continue;
+        }
+        let entry = entries.get(watch.href);
+        if (entry?.control.host.isConnected) continue;
+        const cell = document.createElement('td'); cell.setAttribute('data-replay-list-cell', '');
+        cell.style.cssText = 'box-sizing:border-box;text-align:left;vertical-align:middle;white-space:nowrap;padding:8px 10px;';
+        row.append(cell);
+        if (!entry) { entry = {watchURL: watch.href, title: rowTitle(row), row}; entries.set(watch.href, entry); }
+        else { controls.delete(entry.control); entry.row = row; }
+        entry.control = makeControl(cell, entry);
+      }
+      const header = table.querySelector('thead tr');
+      if (header && !header.querySelector('[data-replay-list-heading]')) {
+        const cell = document.createElement('th'); cell.setAttribute('data-replay-list-heading', ''); cell.setAttribute('scope', 'col');
+        cell.textContent = '下载'; cell.style.textAlign = 'left'; header.append(cell);
+      }
+      const container = document.querySelector('#listContainer') || table.parentElement;
+      if (!bottom?.host.isConnected) {
+        if (bottom) controls.delete(bottom);
+        const bar = document.createElement('div'); bar.setAttribute('data-replay-list-bar', '');
+        bar.style.cssText = 'display:flex;justify-content:flex-end;border-top:1px solid #e4eaf4;padding:12px 10px;margin-top:10px;';
+        container.append(bar); bottom = makeControl(bar, null, true);
+      }
+      const visible = [...entries.values()].filter(entry => entry.row.isConnected);
+      bottom.complete = Boolean(visible.length && visible.every(entry => entry.video));
+      if (active?.current && !active.current.row.isConnected) { active.cancelling = true; active.controller.abort(); }
+      // Also handle sorting/pagination without duplicating buttons or headers.
+      renderAll();
+      reserveLayout();
+      for (const control of controls) positionMenu(control);
+    }
+    const selectedEntries = control => control.batch ? [...entries.values()].filter(entry => entry.row.isConnected) : [control.entry];
+    async function browserSave(file, filename, signal) {
+      signal.throwIfAborted();
+      const url = URL.createObjectURL(file), link = document.createElement('a');
+      try { link.href = url; link.download = filename; link.hidden = true; document.body.append(link); link.click(); }
+      finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000); }
+    }
+    function pickFiles(signal, multiple) {
+      return new Promise((resolve, reject) => {
+        const input = document.createElement('input'); input.type = 'file'; input.accept = '.mp4,.m4a,.ts'; input.multiple = multiple; input.hidden = true;
+        let settled = false;
+        const finish = (error, files) => { if (settled) return; settled = true; signal.removeEventListener('abort', abort); input.remove(); error ? reject(error) : resolve(files); };
+        const abort = () => finish(signal.reason || new DOMException('已取消', 'AbortError'));
+        input.onchange = () => input.files?.length ? finish(null, [...input.files]) : abort();
+        input.addEventListener('cancel', abort); signal.addEventListener('abort', abort, {once: true});
+        document.body.append(input); input.click(); if (signal.aborted) abort();
+      });
+    }
+    async function rollback(sink, error) {
+      if (sink) try { await sink.abort(); } catch (cleanupError) { throw FileOutput.withCleanupFailure(error, cleanupError, sink.type === 'browser-download'); }
+      throw error;
+    }
+    async function download(entry, job, update) {
+      const signal = job.controller.signal, filename = `${entry.title}.mp4`;
+      let sink, committed = false;
+      try {
+        // For a single row, open the picker synchronously from the click.
+        // Batch jobs use the same OPFS handoff on every browser, without a
+        // separate save-location prompt for each recording.
+        sink = await FileOutput.createHlsOutput(filename, 'mp4', signal, () => {}, {browserDownload: job.browserDownload});
+        const source = await resolveSource(entry, signal); signal.throwIfAborted();
+        job.currentEstimate = createEstimate();
+        const report = ({done,total,bytes}) => {
+          job.currentEstimate.note(done/total, bytes);
+          update(done/total, `${(bytes/1048576).toFixed(1)} MB`, bytes);
+        };
+        if (source.kind === 'mp4') {
+          // Older recordings can already be ordinary MP4. Read bounded ranges
+          // through the same authenticated/retrying transport, never a full
+          // recording-sized response or an opaque browser download request.
+          const probe = await job.request(source.url, 'arraybuffer', {start:0,end:0}, signal);
+          const total = probe.rangeTotal;
+          if (!Number.isSafeInteger(total) || total <= 0) throw new Error('服务器未提供 MP4 字节范围信息。');
+          for (let start = 0; start < total; start += 8 * 1024 * 1024) {
+            signal.throwIfAborted();
+            const end = Math.min(total - 1, start + 8 * 1024 * 1024 - 1);
+            const part = await job.request(source.url, 'arraybuffer', {start,end}, signal), bytes = new Uint8Array(part.data);
+            if (bytes.length !== end - start + 1 || (part.rangeTotal && part.rangeTotal !== total)) throw new Error('MP4 分段响应不完整或文件已变化。');
+            if (!start && !['ftyp','moov','free','wide'].includes(String.fromCharCode(...bytes.subarray(4,8)))) throw new Error('服务器返回的内容不是 MP4。');
+            await sink.write(bytes); report({done:end+1,total,bytes:end+1});
+          }
+        } else await Core.download({url: source.url, format: 'mp4', sink, request: job.request, muxjs, mp4Writer, signal, onProgress: report});
+        signal.throwIfAborted(); await sink.close(); committed = true;
+        entry.video = {sink, filename}; entry.localFile = null; entry.needsFile = false;
+      } catch (error) { if (!committed) await rollback(sink, error); throw error; }
+    }
+    async function extract(entry, format, job, update) {
+      const signal = job.controller.signal, filename = entry.video.filename.replace(/\.mp4$/i, '') + (format === 'aac' ? '.m4a' : '.mp3');
+      let sink, committed = false;
+      try {
+        sink = await FileOutput.createHlsOutput(filename, format, signal, () => {}, {browserDownload: job.browserDownload});
+        let written = 0;
+        const output = {
+          async write(bytes) { await sink.write(bytes); written += bytes.byteLength; },
+          async writeAt(bytes, position) { await sink.writeAt(bytes, position); written = Math.max(written, position + bytes.byteLength); },
+        };
+        job.currentEstimate = createEstimate();
+        const convert = file => AudioExport.convert({file, format, sink: output, muxjs, mp4Writer, reader: AudioReader, encoderFactory, signal,
+          onProgress({progress: value,packets}) {
+            job.currentEstimate.note(value, written);
+            update(value, `${format.toUpperCase()} · ${packets} 个音频包`, written);
+          }});
+        if (entry.localFile) await convert(entry.localFile); else await entry.video.sink.withFile(convert);
+        signal.throwIfAborted(); await sink.close(); committed = true;
+      } catch (error) { if (!committed) await rollback(sink, error); throw error; }
+    }
+    async function start(control, mode) {
+      if (active) return;
+      const list = selectedEntries(control); if (!list.length) return;
+      const job = active = {control, controller: new AbortController(), request, browserDownload: control.batch, started: performance.now(), current: null, cancelling: false, holds: []};
+      job.batchEstimate = createEstimate(); job.completedBytes = 0;
+      const updateEstimates = () => {
+        if (job.current) estimate(job.current.control, job.currentEstimate?.read() || {speed:null,remaining:Infinity});
+        if (control.batch) estimate(control, job.batchEstimate.read());
+      };
+      job.estimateTimer = setInterval(updateEstimates, 1000);
+      onJob(job.controller, ({attempt,delay}) => {
+        const text = `${Math.ceil(delay/1000)} 秒后重试（${attempt}/8）`;
+        message(control, text); if (job.current) message(job.current.control, text);
+      });
+      message(control, ''); renderAll(); progress(control, null, '正在准备…');
+      let wakeLock;
+      try {
+        // A single chooser handles expired source copies for a whole batch.
+        if (mode !== 'video') {
+          const missing = list.filter(entry => !available(entry));
+          // Selecting an expired source is a separate user gesture. Use OPFS
+          // afterwards rather than chaining a second native permission picker.
+          if (missing.length) job.browserDownload = true;
+          const files = missing.length ? await pickFiles(job.controller.signal, control.batch) : [];
+          for (const entry of missing) {
+            const file = control.batch ? files.find(file => file.name === entry.video?.filename) : files[0];
+            if (!file) throw new Error('未选择全部待处理的视频。'); entry.localFile = file;
+          }
+          for (const entry of list) if (!entry.localFile && entry.video?.sink.holdHandoff) job.holds.push(entry.video.sink.holdHandoff());
+        }
+        // Do not await a wake-lock permission before opening a native picker:
+        // it must still run directly from the user's download/menu click.
+        try { void navigator.wakeLock?.request('screen').then(lock => {
+          if (active === job && !job.controller.signal.aborted) wakeLock = lock;
+          else void lock.release().catch(() => {});
+        }).catch(() => {}); } catch { /* Optional. */ }
+        for (let index = 0; index < list.length; index++) {
+          const entry = list[index]; job.controller.signal.throwIfAborted(); job.current = entry; job.started = performance.now(); job.currentEstimate = null; job.entryBytes = 0;
+          message(entry.control, ''); renderAll();
+          const update = (value, text, bytes) => {
+            if (bytes !== undefined) {
+              job.entryBytes = bytes;
+              job.batchEstimate.note((index+value)/list.length, job.completedBytes+bytes);
+            }
+            progress(entry.control, value, text);
+            if (control.batch) progress(control, value === null ? index/list.length : (index+value)/list.length, `${index+1}/${list.length} · ${text}`);
+            updateEstimates();
+          };
+          update(null, mode === 'video' ? '正在验证登录态…' : mode === 'resave' ? '正在重新保存…' : '正在提取音频…');
+          if (mode === 'video') {
+            await download(entry, job, update);
+            if (control.batch && entry.video.sink.holdHandoff) job.holds.push(entry.video.sink.holdHandoff());
+          } else if (mode === 'resave') {
+            const save = file => browserSave(file, entry.video.filename, job.controller.signal);
+            if (entry.localFile) await save(entry.localFile); else await entry.video.sink.withFile(save);
+          } else await extract(entry, mode, job, update);
+          update(1, mode === 'video' ? '视频已保存；临时副本将在 5 分钟后清理。' : mode === 'resave' ? '已重新保存。' : '音频已保存。');
+          job.completedBytes += job.entryBytes;
+          if (control.batch) { job.current = null; render(entry.control); }
+        }
+        if (control.batch && mode === 'video') control.complete = true;
+        message(control, '已完成。');
+      } catch (caught) {
+        if (caught.name === 'NotFoundError' && job.current) job.current.needsFile = true;
+        const error = caught.cleanupFailed ? caught : job.controller.signal.aborted ? job.controller.signal.reason || caught : caught;
+        const cancelled = error.name === 'AbortError';
+        const cleanup = error.cleanupFailed ? (error.cleanupRecovery ? '临时文件待清理，页面恢复后重试。' : '撤销写入失败，请检查目标文件。') : '未完成的临时文件已清理。';
+        const text = cancelled ? `已取消；${cleanup}` : `${errorMessage(error)} ${cleanup}`;
+        message(control, text, !cancelled || error.cleanupFailed); if (job.current) message(job.current.control, text, !cancelled || error.cleanupFailed);
+      } finally {
+        clearInterval(job.estimateTimer);
+        for (const release of job.holds) try { await release(); } catch (error) { message(control, '临时副本未能继续保留；重存时请选择已保存的视频。', true); }
+        void wakeLock?.release().catch(() => {});
+        job.current = null; active = null; onJob(null); renderAll();
+      }
+    }
+    document.addEventListener('scroll', () => { for (const control of controls) positionMenu(control); }, true);
+    return {refresh};
+  }
+  return {create, createEstimate, remainingText};
+});
+
+return module.exports; })();
 /* Browser adapter and player UI. The build supplies Core and muxjs. */
 (() => {
   'use strict';
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const discovered = new Map(), observedHeaders = new Map(), observedContexts = new Map(), observedTitles = new Map(), preferGM = new Set();
+  const fileSources = new Set();
   const injected = new WeakMap(), anchorPanels = new WeakMap();
   const panels = new Set();
   let activeJob;
   let onRetry = () => {};
   const courseOrigin = 'https://course.pku.edu.cn';
   const outerCourse = location.origin === courseOrigin;
+  const listPage = outerCourse && location.pathname.endsWith('/videoList.action');
+  let listUI, listSource, backgroundProbe = false;
   let embeddedInCourse = !outerCourse && window.top !== window.self && (Array.from(location.ancestorOrigins || []).includes(courseOrigin) || document.referrer?.startsWith(courseOrigin + '/'));
   const bridgeType = 'PKU_REPLAY_SAVER_SOURCE_V1';
 
@@ -1683,14 +2188,16 @@ return module.exports; })();
 
 
   function sendSources() {
-    for (const url of discovered.keys()) {
-      window.top.postMessage({ type: bridgeType, url, headers: observedHeaders.get(new URL(url).origin) || {}, referrer: location.href, title: document.title || document.querySelector('.course-info__header')?.textContent }, courseOrigin);
+    for (const url of [...discovered.keys(), ...fileSources]) {
+      window.top.postMessage({ type: bridgeType, url, kind: fileSources.has(url) ? 'mp4' : 'hls', headers: observedHeaders.get(new URL(url).origin) || {}, referrer: location.href, title: document.title || document.querySelector('.course-info__header')?.textContent }, courseOrigin);
     }
   }
   window.addEventListener('message', event => {
+    if (listPage) { listSource?.accept(event); return; }
     if (outerCourse && event.origin === 'https://onlineroomse.pku.edu.cn' && event.data?.type === bridgeType) {
       const frame = [...document.querySelectorAll('iframe')].find(frame => frame.contentWindow === event.source);
       if (!frame) return;
+      if (event.data.kind === 'mp4') return; // The compact list handles direct files separately.
       try {
         const url = Core.networkURL(event.data.url, location.href);
         // Only reuse the same-origin Authorization/x-* headers observed by the player.
@@ -1702,6 +2209,8 @@ return module.exports; })();
       } catch { /* Ignore unrelated or invalid frame messages. */ }
     } else if (!outerCourse && event.origin === courseOrigin && event.source === window.top && event.data?.type === bridgeType + '_REQUEST') {
       embeddedInCourse = true;
+      backgroundProbe ||= Boolean(event.data.background);
+      if (backgroundProbe) for (const video of document.querySelectorAll('video')) { video.muted = true; video.pause?.(); }
       for (const panel of panels) { panel.host.remove(); panels.delete(panel); }
       sendSources();
     }
@@ -1709,6 +2218,21 @@ return module.exports; })();
 
   function looksLikePlaylist(url, contentType = '') {
     return /\.m3u8(?:[?#]|$)/i.test(url) || /(?:mpegurl|vnd\.apple\.mpegurl)/i.test(contentType);
+  }
+
+  function captureVideoInfo(url, value) {
+    if (!/get-sub-info-by-auth-data/.test(url || '')) return;
+    try {
+      const info = typeof value === 'string' ? JSON.parse(value) : value;
+      const content = JSON.parse(info.list[0].sub_content), playback = content.save_playback;
+      const source = Array.isArray(playback.contents) ? playback.contents[0]?.preview || playback.contents[0] : playback.contents;
+      if (typeof source === 'string' && looksLikePlaylist(source)) remember(source);
+      else if (typeof source === 'string' && /\.mp4(?:[?#]|$)/i.test(source)) {
+        fileSources.add(Core.networkURL(source, location.href));
+        if (fileSources.size > 50) fileSources.delete(fileSources.values().next().value);
+        if (window.top !== window.self) sendSources();
+      }
+    } catch { /* Playback observation must not interfere with the school page. */ }
   }
 
   // Observe requests in the page realm, including playlists behind blob video URLs.
@@ -1719,6 +2243,7 @@ return module.exports; })();
       captureHeaders(url, args[1]?.headers || args[0]?.headers);
       const promise = originalFetch.apply(this, args);
       promise.then(response => {
+        if (/get-sub-info-by-auth-data/.test(response.url || url || '')) response.clone().json().then(value => captureVideoInfo(response.url || url, value)).catch(() => {});
         if (looksLikePlaylist(response.url || url, response.headers.get('content-type') || '')) {
           response.clone().text().then(text => remember(response.url || url, text)).catch(() => {});
         }
@@ -1743,6 +2268,9 @@ return module.exports; })();
       this.addEventListener('load', () => {
         try {
           const url = this.responseURL || request?.url;
+          if (/get-sub-info-by-auth-data/.test(url || '')) {
+            captureVideoInfo(url, this.responseType === 'json' ? this.response : this.responseText); return;
+          }
           if (!looksLikePlaylist(url, this.getResponseHeader('Content-Type') || '')) return;
           if (!this.responseType || this.responseType === 'text') remember(url, this.responseText);
           else if (this.responseType === 'arraybuffer') remember(url, new TextDecoder().decode(this.response));
@@ -1787,7 +2315,19 @@ return module.exports; })();
         method: 'GET', url, headers, responseType: type, anonymous, timeout: 45000,
         onload(response) {
           if (response.status !== (range ? 206 : 200)) return finish(reject, httpError(response.status));
-          finish(resolve, { data: type === 'text' ? response.responseText : response.response, url: response.finalUrl || url });
+        const total = /content-range:\s*bytes\s+\d+-\d+\/(\d+)/i.exec(response.responseHeaders || '')?.[1];
+        finish(resolve, { data: type === 'text' ? response.responseText : response.response, url: response.finalUrl || url, rangeTotal: total ? Number(total) : undefined });
+        },
+        onreadystatechange(response) {
+          // Stop a server that ignores Range before buffering an entire MP4.
+          if (range && response.readyState === 2 && response.status && response.status !== 206) {
+            finish(reject, httpError(response.status)); try { handle?.abort(); } catch {}
+          }
+        },
+        onprogress(response) {
+          if (range && response.loaded > range.end - range.start + 1) {
+            finish(reject, new Error('服务器返回的字节范围过大。')); try { handle?.abort(); } catch {}
+          }
         },
         onerror() { finish(reject, new Error('网络请求失败，请检查校园网 / VPN 和脚本的跨域访问权限。')); },
         ontimeout() { finish(reject, new Error('视频服务器响应超时。')); },
@@ -1805,7 +2345,8 @@ return module.exports; })();
         if (range) headers.Range = `bytes=${range.start}-${range.end}`;
         const response = await page.fetch(url, { credentials: omitCookies ? 'omit' : 'include', headers, referrer: location.href, signal });
         if (response.status !== (range ? 206 : 200)) throw httpError(response.status);
-        return { data: type === 'text' ? await response.text() : await response.arrayBuffer(), url: response.url };
+        const total = /bytes\s+\d+-\d+\/(\d+)/i.exec(response.headers.get('content-range') || '')?.[1];
+        return { data: type === 'text' ? await response.text() : await response.arrayBuffer(), url: response.url, rangeTotal: total ? Number(total) : undefined };
       } catch (error) {
         if (signal?.aborted || error.name === 'AbortError') throw error;
         // GM requests carry the browser's cookies and bypass page CORS restrictions.
@@ -2004,7 +2545,7 @@ return module.exports; })();
     const filename = `${panel.rename.checked ? title : '录播'}${maxDuration ? '-5min-test' : ''}${format === 'fmp4' ? '-fMP4' : ''}.${format === 'ts' ? 'ts' : 'mp4'}`;
     activeJob = new AbortController();
     const job = activeJob;
-    let sink, wakeLock, committed = false, stopSink, handoffUrl;
+    let sink, wakeLock, committed = false, stopSink, handoffUrl, estimateTimer;
     for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = true;
     panel.url.disabled = panel.sources.disabled = panel.format.disabled = panel.rename.disabled = true;
     panel.cancel.hidden = false; panel.save.hidden = true; panel.progress.value = 0;
@@ -2012,7 +2553,12 @@ return module.exports; })();
     panel.percent.textContent = '0%'; panel.status.dataset.state = 'active';
     panel.metrics.textContent = '0 MB · 速度 — · 剩余时间 —';
     panel.status.textContent = '请选择保存位置…';
-    const started = performance.now();
+    const estimator = ProgressEstimate.createEstimate();
+    let downloaded = 0;
+    const updateMetrics = () => {
+      const {speed, remaining} = estimator.read();
+      panel.metrics.textContent = `${(downloaded / 1048576).toFixed(1)} MB · ${speed === null ? '—' : (speed / 1048576).toFixed(2)} MB/s · 剩余约 ${formatTime(remaining)}`;
+    };
     onRetry = ({ attempt, delay }) => { panel.status.textContent = `请求失败，${Math.ceil(delay / 1000)} 秒后重试（第 ${attempt}/8 次）；可取消下载。`; };
     try {
       sink = await FileOutput.createHlsOutput(filename, format, job.signal, link => {
@@ -2024,12 +2570,12 @@ return module.exports; })();
       job.signal.throwIfAborted();
       panel.status.textContent = '正在读取播放列表并验证登录态…';
       try { wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* Optional. */ }
+      estimateTimer = setInterval(updateMetrics, 1000);
       await Core.download({ url, request, sink, muxjs, mp4Writer, format, maxDuration, signal: job.signal,
         onProgress({ done, total, bytes }) {
           panel.progress.max = total; panel.progress.value = done;
           panel.percent.textContent = `${(100 * done / total).toFixed(1)}%`;
-          const elapsed = Math.max(0.001, (performance.now() - started) / 1000);
-          panel.metrics.textContent = `${(bytes / 1048576).toFixed(1)} MB · ${(bytes / elapsed / 1048576).toFixed(2)} MB/s · 剩余约 ${formatTime(elapsed * (total - done) / done)}`;
+          downloaded = bytes; estimator.note(done / total, bytes); updateMetrics();
           panel.status.textContent = `正在下载视频分片 ${done}/${total}…`;
         },
       });
@@ -2056,6 +2602,7 @@ return module.exports; })();
       panel.status.dataset.state = error.name === 'AbortError' ? 'neutral' : 'error';
       panel.status.textContent = `${error.name === 'AbortError' ? '下载已取消。' : '下载失败：' + errorMessage(error)} ${cleanup}`;
     } finally {
+      clearInterval(estimateTimer);
       job.signal.removeEventListener('abort', stopSink);
       void wakeLock?.release().catch(() => {});
       onRetry = () => {}; activeJob = null;
@@ -2075,24 +2622,27 @@ return module.exports; })();
     const format = panel.audioformat.value;
     const filename = source.filename.replace(/(?:-fMP4)?\.(?:mp4|ts)$/i, '') + (format === 'aac' ? '.m4a' : '.mp3');
     const job = activeJob = new AbortController();
-    let sink, committed = false, stopSink, handoffUrl;
+    let sink, committed = false, stopSink, handoffUrl, estimateTimer;
     for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = true;
     panel.audioformat.disabled = true; panel.cancel.hidden = false; panel.status.dataset.state = 'active';
     panel.audiosave.hidden = true; panel.progress.max = 1; panel.progress.value = 0; panel.percent.textContent = '0%';
+    panel.metrics.textContent = '已处理 0 个音频包 · 剩余约 —';
     panel.status.textContent = '请选择音频保存位置…';
     const diagnostics = [];
     panel.audioDebug.hidden = false; panel.audioDebug.open = false;
     const recordDiagnostic = value => {
       diagnostics.push(value);
       if (diagnostics.length > 100) diagnostics.splice(30, diagnostics.length - 100);
-      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.5.6-debug', events: diagnostics}, null, 2);
+      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.6.3-debug', events: diagnostics}, null, 2);
     };
     recordDiagnostic({stage: 'browser', userAgent: navigator.userAgent, selectedFormat: format,
       sandboxAudioDecoder: typeof globalThis.AudioDecoder, pageAudioDecoder: typeof page.AudioDecoder,
       sandboxAudioContext: typeof globalThis.AudioContext, pageAudioContext: typeof page.AudioContext,
       sameDecoder: globalThis.AudioDecoder === page.AudioDecoder, sameAudioContext: globalThis.AudioContext === page.AudioContext,
       Worker: typeof globalThis.Worker, source: panel.localAudioFile ? 'selected-file' : source.sink.type});
-    const started = performance.now();
+    const estimator = ProgressEstimate.createEstimate();
+    let processedPackets = 0;
+    const updateMetrics = () => { panel.metrics.textContent = `已处理 ${processedPackets} 个音频包 · 剩余约 ${formatTime(estimator.read().remaining)}`; };
     try {
       // Open the output from the user's click before any asynchronous file reads.
       sink = await FileOutput.createHlsOutput(filename, format, job.signal, link => {
@@ -2101,13 +2651,13 @@ return module.exports; })();
       });
       stopSink = () => { void sink.abort().catch(error => console.warn('[PKU-Replay-Saver] 音频文件回收待重试', error)); };
       job.signal.addEventListener('abort', stopSink, {once: true}); job.signal.throwIfAborted();
+      estimateTimer = setInterval(updateMetrics, 1000);
       const convert = file => AudioExport.convert({file, format, sink, muxjs, mp4Writer,
         reader: AudioReader, encoderFactory: mp3EncoderFactory, signal: job.signal, onDiagnostic: recordDiagnostic,
         onProgress({progress, packets}) {
           panel.progress.value = progress; panel.percent.textContent = `${(progress * 100).toFixed(1)}%`;
           panel.status.textContent = format === 'aac' ? '正在提取 AAC 音频，无需重新编码…' : '正在转换为 MP3…';
-          const elapsed = Math.max(0.001, (performance.now() - started) / 1000);
-          panel.metrics.textContent = `已处理 ${packets} 个音频包 · 剩余约 ${formatTime(progress > 0 ? elapsed * (1 - progress) / progress : Infinity)}`;
+          processedPackets = packets; estimator.note(progress); updateMetrics();
         },
       });
       if (panel.localAudioFile) await convert(panel.localAudioFile);
@@ -2128,6 +2678,7 @@ return module.exports; })();
       panel.status.dataset.state = error.name === 'AbortError' ? 'neutral' : 'error';
       panel.status.textContent = `${error.name === 'AbortError' ? '音频转换已取消。' : caughtError.name === 'NotFoundError' ? '原视频已移除，请再次点击“保存音频”选择已保存的视频。' : '音频保存失败：' + errorMessage(error)} ${cleanup}`;
     } finally {
+      clearInterval(estimateTimer);
       job.signal.removeEventListener('abort', stopSink); activeJob = null;
       panel.audioformat.disabled = false; panel.cancel.hidden = true;
       for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = false;
@@ -2144,6 +2695,22 @@ return module.exports; })();
   }
 
   function injectPanels() {
+    if (listPage) {
+      if (!listUI) {
+        listSource = ListSource.create({document, location, validateURL: Core.networkURL});
+        listUI = ListPage.create({document, location, Core, FileOutput, AudioExport, AudioReader, muxjs, mp4Writer,
+          encoderFactory: mp3EncoderFactory, request, errorMessage,
+          onJob(controller, retry) { activeJob = controller; onRetry = retry || (() => {}); },
+          async resolveSource(entry, signal) {
+            const source = await listSource.resolve(entry, signal);
+            observedContexts.set(new URL(source.url).origin, {referer: source.referrer, origin: source.origin});
+            if (source.kind === 'mp4' && typeof GM_xmlhttpRequest === 'function') preferGM.add(new URL(source.url).origin);
+            captureHeaders(source.url, source.headers); return source;
+          }});
+      }
+      listUI.refresh(); return;
+    }
+    if (backgroundProbe) for (const video of document.querySelectorAll('video')) { video.muted = true; video.pause?.(); }
     if (outerCourse) {
       for (const frame of document.querySelectorAll('iframe')) {
         let url;
@@ -2184,7 +2751,7 @@ return module.exports; })();
   observer.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', injectPanels, { once: true });
   else injectPanels();
-  if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('打开录播下载面板', showPanel);
+  if (!listPage && typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('打开录播下载面板', showPanel);
   window.addEventListener('resize', injectPanels);
   window.addEventListener('load', injectPanels);
   FileOutput.startHlsTempCleanup();
