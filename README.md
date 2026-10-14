@@ -1,38 +1,35 @@
 # PKU-Replay-Saver
 
-Download a complete lecture or its first five minutes, with a progress bar directly
-below the video. Saves standard MP4 for Safari/QuickTime and Chrome/Edge, or original
-TS. Uses your current login; no FFmpeg, Python, WASM, or server is needed.
+使用当前浏览器登录态保存北大录播，无需服务器、本地 FFmpeg、WASM 或 CDN。
 
-## Install
+## 安装
 
-1. Install **Tampermonkey** in your browser.
-2. Open **PKU-Replay-Saver.user.js** on GitHub and click **Raw** to install it.
-   Alternatively, import the downloaded file through Tampermonkey's dashboard,
-   or paste its contents into a new script and save.
-3. Reload your logged-in video page and start playback.
+1. 安装 Tampermonkey。
+2. 在 GitHub 打开 `PKU-Replay-Saver.user.js`，点击 **Raw** 安装；也可在 Tampermonkey 中导入文件。
+3. 重新打开已登录的录播页面并开始播放。手动更新时替换已有脚本，避免重复安装。
 
-When updating an existing installation manually, replace that script's contents.
-If scripts don't run in Chrome/Edge, enable **Allow user scripts** in Tampermonkey's
-extension settings.
+支持 `https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/` 下的录播页面和其中的嵌套播放器。面板位于滚动容器外的下方，显示进度、速度、剩余时间，支持取消、重试和重命名。Chrome / Edge 如无法运行脚本，可在扩展设置中启用允许用户脚本。
 
-## Download
+## 使用
 
-Click **Download first 5 minutes** to check picture and sound, or **Download full
-video** to save the entire recording. The test clip ends at an HLS segment boundary,
-so it can be a few seconds longer than five minutes.
+先点「下载前 5 分钟测试」，再下载完整录播。测试按完整分片截取，可能略长于 5 分钟。下载和转换过程中请保持页面打开。
 
-Keep the page open until completion. If **Save finished video** appears, click it to
-save the completed file. **Cancel** stops the download.
+| 格式 | 说明 |
+| --- | --- |
+| MP4（默认） | 普通 MP4，重新生成完整样本索引，适合 Safari / QuickTime 等播放器。 |
+| fMP4 | 分片 MP4；个人测试可能无法在 QuickTime Player 正常播放。 |
+| TS | 解密后的原始 TS，适合 IINA / VLC。 |
 
-If the stream isn't detected, open **Stream settings** and paste its `.m3u8` URL
-from browser DevTools. Complete, combined audio/video HLS recordings are supported;
-live streams, DRM, and separate audio playlists are unsupported.
+三种视频格式保留原始音视频编码，实际容器与扩展名一致。视频下载完成后可点「保存音频」：MP3（默认）兼容性更好，需要重新编码；AAC 保存为 `.m4a`，无需重新编码。音频导出读取已下载的视频，不重复联网；支持单声道 / 双声道 AAC-LC、处理进度和取消。
 
-## Credits
+媒体按分片和音频批次处理，不将整段录播或解码音频累计在内存中；完整 MP4 索引仍随时长增长。写盘时会为必要的数组切片创建独立缓冲区，避免 Safari 写入错误范围，额外内存限于当前写入。
 
-Includes [mux.js](https://github.com/videojs/mux.js) 6.3.0 (Apache-2.0) and
-[Mediabunny](https://github.com/Vanilagy/mediabunny) 1.61.4 (MPL-2.0).
-The downloader's own code is MIT licensed. Full terms are in `LICENSE` and
-`THIRD-PARTY-LICENSES.txt`.
-# PKU-Replay-Saver
+Chrome / Edge 可选择保存位置；其他环境先写浏览器私有存储，完成后交给下载管理器。完整临时副本保留 5 分钟，可再次保存；期间开始音频转换会保护副本直到读取结束。副本已清理时，可选择已保存的视频，再点「保存音频」。
+
+取消或失败会停止任务并回收未完成的临时文件，已完成的视频会保留。删除失败会保留清理记录并重试；浏览器被强杀后，下次页面运行且存储可用时恢复清理。通过保存对话框选择的目标由浏览器管理，脚本撤销未完成写入，不删除用户已有文件；撤销失败时需检查所选位置。
+
+普通 MP4 在结束时生成索引，中断文件不会作为成品保存。目前不支持断点续传、直播、DRM、音视频分离或时间线不连续的录播。播放地址未检测到时，可在「播放地址设置」中填入 `.m3u8` 地址。
+
+## 署名与许可
+
+自有代码为 MIT；内置 mux.js 6.3.0（Apache-2.0）和 lamejs 1.2.1（LGPL-3.0）。完整许可见 `LICENSE` 和 `THIRD-PARTY-LICENSES.txt`；lamejs 对应源码为 `lamejs-1.2.1-source.tgz`。安装仅需 userscript 文件。
