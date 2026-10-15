@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Replay-Saver
 // @namespace    pku-replay-saver
-// @version      1.6.4
+// @version      1.8.2
 // @description  使用当前登录态下载北大录播，支持普通 MP4、fMP4 和 TS，可另存 MP3 / AAC 音频，显示进度与剩余时间。
 // @match        https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/*
 // @match        https://onlineroomse.pku.edu.cn/player*
@@ -438,7 +438,7 @@ async function recoverTempFiles(root) {
                 const raw = localStorage.getItem(RECORD_PREFIX + name);
                 let record;
                 try { record = raw ? JSON.parse(raw) : null; } catch { record = null; }
-                if (record?.deleteAfter > Date.now()) return;
+                if (record?.state === 'handoff' && (record.keepForever || record.deleteAfter > Date.now())) return;
                 if (!raw) {
                     // Older scripts did not own a Web Lock: retain their original age limit.
                     try {
@@ -476,12 +476,114 @@ function startHlsTempCleanup() {
     setInterval(recover, 60 * 1000);
 }
 
-async function createHlsOutput(fileName, format, signal, onHandoff, { browserDownload = false } = {}) {
+// Directory permissions are kept only for this page, shared by all download jobs.
+let destination, selectingDestination;
+const destinationListeners = new Set(), reservedNames = new Set();
+const pageWindow = () => typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+function destinationInfo() {
+    const page = pageWindow();
+    return {supported: page.top === page.self && typeof page.showDirectoryPicker === 'function', selected: Boolean(destination), name: destination?.name || ''};
+}
+function watchDestination(callback) { destinationListeners.add(callback); callback(destinationInfo()); return () => destinationListeners.delete(callback); }
+function prepareDestination(change = false) {
+    if (!destinationInfo().supported) return Promise.resolve(null);
+    if (selectingDestination) return selectingDestination;
+    if (destination && !change) return Promise.resolve(destination);
+    // Invoke synchronously from the click; queued jobs reuse the granted handle.
+    const request = pageWindow().showDirectoryPicker({id:'pku-replay-saver', mode:'readwrite', startIn:'downloads'});
+    selectingDestination = Promise.resolve(request).then(handle => {
+        destination = handle;
+        for (const callback of destinationListeners) callback(destinationInfo());
+        return handle;
+    }).finally(() => { selectingDestination = null; });
+    return selectingDestination;
+}
+async function nativeOutput(handle, signal, {fileName, remove, finish = () => {}} = {}) {
+    let writable, closed = false, missing = false, abortTask, closeTask;
+    const abort = () => closed ? Promise.resolve() : (abortTask ||= (async () => {
+        if (closeTask) await closeTask.catch(() => {});
+        if (closed) return;
+        let failure;
+        try { if (writable) await writable.abort(); } catch (error) { failure = error; }
+        try { if (remove) await remove(); } catch (error) { failure = error; }
+        finally { finish(); }
+        if (failure) throw failure;
+    })());
+    try { signal.throwIfAborted(); writable = await handle.createWritable(); signal.throwIfAborted(); }
+    catch (error) { try { await abort(); } catch (cleanupError) { throw withCleanupFailure(error, cleanupError); } throw error; }
+    const write = chunk => {
+        signal.throwIfAborted();
+        if (abortTask) throw new DOMException('下载已取消', 'AbortError');
+        return writable.write(writeChunk(chunk));
+    };
+    return {
+        type: remove ? 'directory' : 'file-picker', fileName,
+        get fileAvailable() { return closed && !missing; }, setRetention() {},
+        async withFile(callback) {
+            if (!closed) throw new Error('文件尚未保存完成');
+            let file;try{file=await handle.getFile();}catch(error){if(error.name==='NotFoundError')missing=true;throw error;}
+            return callback(file);
+        },
+        write, writeAt: (chunk, position) => write({type:'write',position,data:chunk}),
+        async close() {
+            signal.throwIfAborted(); if (abortTask) throw new DOMException('下载已取消', 'AbortError');
+            closeTask = writable.close().then(() => { closed = true; finish(); }); await closeTask;
+        }, abort,
+    };
+}
+async function directoryOutput(fileName, signal) {
+    const folder = destination; // A later directory change must not redirect this transaction.
+    const dot = fileName.lastIndexOf('.'), stem = dot > 0 ? fileName.slice(0,dot) : fileName, extension = dot > 0 ? fileName.slice(dot) : '';
+    let allocated, created = false, delegated = false;
+    const remove = async () => { if (created) try { await folder.removeEntry(allocated); } catch (error) { if (error.name !== 'NotFoundError') throw error; } };
+    try {
+        for (let index = 1; ; index++) {
+            signal.throwIfAborted();
+            const name = index === 1 ? fileName : `${stem} (${index})${extension}`;
+            if (reservedNames.has(name)) continue;
+            reservedNames.add(name); allocated = name;
+            try { await folder.getFileHandle(name); }
+            catch (error) { if (error.name === 'NotFoundError') break; throw error; }
+            reservedNames.delete(name); allocated = undefined;
+        }
+        signal.throwIfAborted(); created = true;
+        const handle = await folder.getFileHandle(allocated, {create:true});
+        delegated=true;
+        return await nativeOutput(handle, signal, {fileName:allocated, remove, finish:()=>reservedNames.delete(allocated)});
+    } catch (error) {
+        if(delegated)throw error;
+        try { await remove(); } catch (cleanupError) { throw withCleanupFailure(error, cleanupError); }
+        finally { reservedNames.delete(allocated); }
+        throw error;
+    }
+}
+async function saveFile(file, fileName, signal) {
+    signal.throwIfAborted();
+    if (destination) {
+        const format = /\.mp3$/i.test(fileName) ? 'mp3' : /\.m4a$/i.test(fileName) ? 'aac' : /\.ts$/i.test(fileName) ? 'ts' : 'mp4';
+        const output = await createHlsOutput(fileName, format, signal);
+        try {
+            for (let offset=0;offset<file.size;offset+=8*1024*1024) await output.write(new Uint8Array(await file.slice(offset,offset+8*1024*1024).arrayBuffer()));
+            await output.close(); return output;
+        } catch (error) { try { await output.abort(); } catch (cleanupError) { throw withCleanupFailure(error,cleanupError); } throw error; }
+    }
+    const url=URL.createObjectURL(file),link=document.createElement('a');
+    try { link.href=url;link.download=fileName;link.hidden=true;document.body.append(link);link.click(); }
+    finally { link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000); }
+}
+
+async function createHlsOutput(fileName, format, signal, onHandoff, { browserDownload = false, cacheOnly = false, retentionMs = HANDOFF_DELAY } = {}) {
+    const validateRetention = value => {
+        if (!Number.isSafeInteger(value) || value < 0 || value > 86400000) throw new Error('无效的缓存保留时间');
+        return value;
+    };
+    validateRetention(retentionMs);
     signal.throwIfAborted();
     // Call the picker on the real page window: the sandboxed `window` proxy fails
     // its brand check and throws "Illegal invocation".
-    const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    if (!browserDownload && page.top === page.self && typeof page.showSaveFilePicker === 'function') {
+    const page = pageWindow();
+    if (destination && !cacheOnly) return directoryOutput(fileName, signal);
+    if (!browserDownload && !cacheOnly && page.top === page.self && typeof page.showSaveFilePicker === 'function') {
         const handle = await page.showSaveFilePicker({
             suggestedName: fileName,
             types: [{
@@ -489,38 +591,7 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
                 accept: format === 'mp3' ? { 'audio/mpeg': ['.mp3'] } : format === 'aac' ? { 'audio/mp4': ['.m4a'] } : format !== 'ts' ? { 'video/mp4': ['.mp4'] } : { 'video/mp2t': ['.ts'] },
             }],
         });
-        signal.throwIfAborted();
-        const writable = await handle.createWritable();
-        let closed = false;
-        let abortTask;
-        let closeTask;
-        const abort = () => closed ? Promise.resolve() : (abortTask ||= (async () => {
-            if (closeTask) await closeTask.catch(() => {});
-            if (!closed) await writable.abort();
-        })());
-        try { signal.throwIfAborted(); } catch (error) {
-            try { await abort(); } catch (cleanupError) { throw withCleanupFailure(error, cleanupError); }
-            throw error;
-        }
-        const write = (chunk) => {
-            signal.throwIfAborted();
-            if (abortTask) throw new DOMException('下载已取消', 'AbortError');
-            return writable.write(writeChunk(chunk));
-        };
-        return {
-            type: 'file-picker',
-            get fileAvailable() { return closed; },
-            async withFile(callback) { if (!closed) throw new Error('视频尚未保存完成'); return callback(await handle.getFile()); },
-            write,
-            writeAt: (chunk, position) => write({ type: 'write', position, data: chunk }),
-            async close() {
-                signal.throwIfAborted();
-                if (abortTask) throw new DOMException('下载已取消', 'AbortError');
-                closeTask = writable.close().then(() => { closed = true; });
-                await closeTask;
-            },
-            abort,
-        };
+        return nativeOutput(handle, signal, {fileName});
     }
 
     if (!navigator.storage?.getDirectory || !navigator.locks?.request) {
@@ -538,7 +609,7 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
     let abortTask;
     let cleanupTimer;
     let closeTask;
-    let readers = 0, cleanupDue = false, removed = false;
+    let readers = 0, cleanupDue = false, removed = false, discardRequested = false;
     const revokeUrl = () => {
         try { if (objectUrl) { URL.revokeObjectURL(objectUrl); onHandoff?.(null); } }
         catch (error) { console.warn('[PKU-Replay-Saver] 释放下载链接失败', error); }
@@ -550,6 +621,15 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
             revokeUrl(); await removeTempFile(root, name); removed = true;
         } catch (error) { warn(error); }
         finally { await release(); }
+    };
+    const rememberHandoff = state => {
+        localStorage.setItem(RECORD_PREFIX + name, JSON.stringify({state,
+            deleteAfter: retentionMs ? Date.now() + retentionMs : null, keepForever: retentionMs === 0}));
+    };
+    const scheduleCleanup = (state = 'handoff') => {
+        rememberHandoff(state);
+        clearTimeout(cleanupTimer); cleanupDue = false;
+        if (retentionMs) cleanupTimer = setTimeout(cleanupAfterHandoff, retentionMs);
     };
     const abort = () => {
         if (handedOff) return Promise.resolve(); // A complete file is already offered to the browser.
@@ -585,6 +665,21 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
         return {
             type: 'browser-download',
             get fileAvailable() { return handedOff && !removed; },
+            setRetention(value) {
+                retentionMs = validateRetention(value);
+                if (handedOff && !removed) scheduleCleanup();
+            },
+            async dispose() {
+                if (removed) return;
+                clearTimeout(cleanupTimer);discardRequested=true;cleanupDue=true;
+                // Clear an infinite retention preference before attempting deletion.
+                try { localStorage.setItem(RECORD_PREFIX + name, JSON.stringify({state:'cleanup'})); }
+                catch (error) { warn(error); }
+                if(readers)return; // The last reader/lease completes this cleanup.
+                try { revokeUrl(); await removeTempFile(root,name); removed=true; }
+                catch (error) { throw withCleanupFailure(error,error,true); }
+                finally { await release(); }
+            },
             holdHandoff() {
                 if (!handedOff || removed) throw new DOMException('视频临时副本已清理', 'NotFoundError');
                 readers++;
@@ -592,11 +687,8 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
                 return async () => {
                     if (released) return; released = true;
                     try {
-                        // Give a completed batch the same five-minute re-save
-                        // window as a single download, without loading files.
-                        localStorage.setItem(RECORD_PREFIX + name, JSON.stringify({state: 'handoff', deleteAfter: Date.now() + HANDOFF_DELAY}));
-                        clearTimeout(cleanupTimer); cleanupDue = false;
-                        cleanupTimer = setTimeout(cleanupAfterHandoff, HANDOFF_DELAY);
+                        // Restart the selected retention window after use.
+                        if(!discardRequested)scheduleCleanup();
                     } finally {
                         readers--; if (!readers && cleanupDue) await cleanupAfterHandoff();
                     }
@@ -616,6 +708,9 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
                 closeTask = writable.close().then(() => { closed = true; });
                 await closeTask;
                 signal.throwIfAborted();
+                if (cacheOnly) {
+                    scheduleCleanup(); handedOff = true; return;
+                }
                 const file = await handle.getFile();
                 signal.throwIfAborted();
                 objectUrl = URL.createObjectURL(file);
@@ -624,12 +719,14 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
                 link.href = objectUrl;
                 link.download = fileName;
                 link.style.display = 'none';
-                localStorage.setItem(RECORD_PREFIX + name, JSON.stringify({ state: 'handoff', deleteAfter: Date.now() + HANDOFF_DELAY }));
                 // Arrange cleanup before touching the DOM so handoff errors cannot strand the lock.
-                cleanupTimer = setTimeout(cleanupAfterHandoff, HANDOFF_DELAY);
+                scheduleCleanup('prepared');
                 try {
                     document.body.appendChild(link);
                     link.click();
+                    // Only a successful handoff may opt out of crash cleanup.
+                    // If this write fails, the prepared record remains reclaimable.
+                    rememberHandoff('handoff');
                     handedOff = true;
                 } finally {
                     try { link.remove(); }
@@ -644,7 +741,7 @@ async function createHlsOutput(fileName, format, signal, onHandoff, { browserDow
     }
 }
 
-return { createHlsOutput, startHlsTempCleanup, withCleanupFailure };
+return { createHlsOutput, startHlsTempCleanup, withCleanupFailure, prepareDestination, destinationInfo, watchDestination, saveFile };
 });
 
 return module.exports; })();
@@ -1821,7 +1918,7 @@ const require = name => { if (name === './progress-estimate.js') return Progress
     .main,.ring{grid-column:primary;grid-row:1;justify-self:start}.audio,.cancel{grid-column:secondary;grid-row:1;justify-self:start}.warning{grid-column:warning;grid-row:1}
     .metrics{grid-column:metrics;grid-row:1;font-size:11px;line-height:15px;color:#667085;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;visibility:hidden}
     button,summary{font:inherit;cursor:pointer;border:1px solid #d6dde8;border-radius:7px;padding:5px 10px;background:#fff;color:#32445f;white-space:nowrap}
-    .main{background:#2563eb;color:white;border-color:#2563eb}button:hover,summary:hover{filter:brightness(.95)}button:disabled,summary[aria-disabled=true]{opacity:.45;cursor:default}
+    .main{background:transparent;color:var(--watch-color,#006b8f);border:0;padding:5px 0;border-radius:0}.main:hover:not(:disabled){text-decoration:underline}.controls[data-batch=true] .main{background:#2563eb;color:white;border:1px solid #2563eb;border-radius:7px;padding:5px 10px;text-decoration:none}button:disabled{opacity:.45;cursor:default}
     .cancel{font-size:12px;padding:3px 7px;color:#a33838}details{position:relative}summary{list-style:none}summary::-webkit-details-marker{display:none}summary::after{content:' ▾';font-size:10px}
     .menu{position:absolute;right:0;top:calc(100% + 4px);z-index:100;min-width:110px;padding:4px;background:white;border:1px solid #d6dde8;border-radius:8px;box-shadow:0 4px 16px #0002}
     .menu button{display:block;width:100%;text-align:left;border:0}.ring{position:relative;width:34px;height:34px;flex:0 0 34px}.ring svg{width:34px;height:34px;transform:rotate(-90deg)}
@@ -1831,11 +1928,16 @@ const require = name => { if (name === './progress-estimate.js') return Progress
   `;
   function create({document, location, Core, FileOutput, AudioExport, AudioReader, muxjs, mp4Writer, encoderFactory,
     resolveSource, request, errorMessage, onJob = () => {}}) {
-    const entries = new Map(), controls = new Set(), pending = [];
-    let active, bottom, table, layoutObserver, observedContainer, leaving = false;
+    const entries = new Map(), controls = new Set(), pending = [], auxiliary = [];
+    let active, auxiliaryActive, bottom, table, layoutObserver, observedContainer, choices, leaving = false;
+    const notifyJobs = () => onJob(active?.controller || auxiliaryActive?.controller || null, active?.retry);
     const available = entry => Boolean(entry.localFile || (!entry.needsFile && entry.video?.sink.fileAvailable));
-    const reserved = entry => active?.list.includes(entry) || pending.some(task => task.list.includes(entry));
-    const downloadable = control => selectedEntries(control).filter(entry => !entry.video && !reserved(entry));
+    const settings = () => ({content: choices?.querySelector('.content').value || 'video', audioFormat: choices?.querySelector('.audioformat').value || 'aac', videoFormat: choices?.querySelector('.format').value || 'mp4'});
+    const satisfied = (entry, options) => (options.content === 'audio' || entry.video?.saved) && (options.content === 'video' || entry.audio?.[options.audioFormat]);
+    const reserved = entry => (active?.list.includes(entry) && !active.skipped.has(entry) && !active.finished.has(entry)) || pending.some(task => task.list.includes(entry)) || auxiliaryActive?.list.includes(entry) || auxiliary.some(task=>task.list.includes(entry));
+    const downloadable = (control, options = settings()) => selectedEntries(control).filter(entry => !satisfied(entry, options) && !reserved(entry));
+    const waitingTask = control => pending.find(task => task.control === control || (!control.batch && task.list.includes(control.entry)));
+    const waitingInBatch = control => !control.batch && active?.control.batch && active.list.indexOf(control.entry) > active.index && !active.skipped.has(control.entry);
     function message(control, text, error = false) {
       control.message.textContent = text; control.warning.hidden = !error; control.warning.title = text;
       control.progressText = text;
@@ -1856,26 +1958,40 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       control.ring.title = `${control.progressText || ''} · ${control.metrics.title}`;
     }
     function render(control) {
-      const busy = active && (active.control === control || active.current?.control === control || (control.batch && !active.control.host.isConnected));
-      const queued = pending.some(task => task.control === control);
+      const owner = auxiliaryActive?.control === control ? auxiliaryActive : active;
+      const busy = owner && (owner.control === control || owner.current?.control === control || (control.batch && !owner.control.host.isConnected));
+      const queued = waitingTask(control) || waitingInBatch(control) || auxiliary.some(task=>task.control===control);
       const occupied = busy || queued;
       const done = control.batch ? control.complete : Boolean(control.entry.video);
       control.main.hidden = Boolean(occupied); control.ring.hidden = !occupied; control.cancel.hidden = !occupied;
       control.audio.hidden = !done || Boolean(occupied);
       control.metrics.style.visibility = busy ? 'visible' : 'hidden';
-      control.main.textContent = done ? (control.batch ? '重存全部' : '重存') : (control.batch ? '下载全部' : '下载');
-      control.main.title = done ? '重新保存已完成的视频' : '保存完整 MP4';
-      control.main.disabled = leaving || Boolean(occupied) || Boolean(active && (done || !downloadable(control).length));
-      control.summary.setAttribute('aria-disabled', String(Boolean(active)));
-      for (const button of control.audio.querySelectorAll('button')) button.disabled = Boolean(active);
-      control.cancel.disabled = Boolean(busy && active.cancelling);
-      control.cancel.textContent = busy && active.cancelling ? '取消中' : '取消';
+      const videoSaved = control.batch ? selectedEntries(control).every(entry => entry.video?.saved) : control.entry.video?.saved;
+      const audioSaved = selectedEntries(control).every(entry => entry.audio?.[settings().audioFormat]);
+      control.main.textContent = done ? (control.batch ? (videoSaved ? '重存全部' : '保存全部') : (videoSaved ? '再次保存' : '保存视频')) : (control.batch ? '下载全部' : '下载');
+      control.audio.textContent = control.batch ? (audioSaved ? '重存全部音频' : '保存全部音频') : (audioSaved ? '再次保存' : '保存音频');
+      control.main.title = done ? (videoSaved ? '再次保存视频' : '保存缓存中的视频') : '按所选内容下载';
+      control.audio.title = `${settings().audioFormat.toUpperCase()} · ${audioSaved ? '再次保存音频' : '保存音频'}`;
+      control.main.disabled = leaving || Boolean(occupied) || Boolean(active && !done && !downloadable(control).length) || Boolean(control.batch && done && (active || auxiliaryActive));
+      control.audio.disabled = leaving || Boolean(occupied) || Boolean(control.batch && (active || auxiliaryActive));
+      const cancelling = busy && (owner.cancelling || (!control.batch && owner.rowCancelling));
+      control.cancel.disabled = Boolean(cancelling);
+      control.cancel.textContent = cancelling ? '取消中' : '取消';
       if (queued && !busy) { progress(control, null, '排队中'); control.percent.textContent = '排队'; }
     }
     function renderAll() {
       const visible = [...entries.values()].filter(entry => entry.row.isConnected);
       if (bottom) bottom.complete = Boolean(visible.length && visible.every(entry => entry.video));
       for (const control of controls) render(control);
+      if (choices) {
+        choices.querySelector('.directory').disabled = Boolean(active || auxiliaryActive);
+        choices.querySelector('.audioformat').disabled = settings().content === 'video';
+        choices.querySelector('.format').disabled = settings().content === 'audio';
+        for (const select of choices.querySelectorAll('select')) {
+          select.style.opacity = select.disabled ? '.45' : '1';
+          select.style.backgroundColor = select.disabled ? '#f1f3f5' : 'white';
+        }
+      }
     }
     function clearPending(text) {
       for (const task of pending) message(task.control, text);
@@ -1885,42 +2001,47 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       if (active || leaving) return;
       while (pending.length) {
         const task = pending.shift();
-        task.list = task.list.filter(entry => entry.row.isConnected && !entry.video);
+        task.list = task.list.filter(entry => entry.row.isConnected && !satisfied(entry, task.options));
         if (!task.control.host.isConnected || !task.list.length) continue;
         void start(task.control, task.mode, task); return;
       }
       renderAll();
     }
-    function positionMenu(control) {
-      if (!control.audio.open || !control.summary.getBoundingClientRect) return;
-      const rect = control.summary.getBoundingClientRect(), viewport = document.documentElement.clientWidth || 1024;
-      const menu = control.audio.querySelector('.menu'), height = menu.getBoundingClientRect().height || 76;
-      menu.style.position = 'fixed'; menu.style.right = 'auto';
-      menu.style.left = `${Math.max(8, Math.min(rect.right - 110, viewport - 118))}px`;
-      menu.style.top = `${Math.max(8, rect.bottom + height + 8 > (document.documentElement.clientHeight || 768) ? rect.top - height - 4 : rect.bottom + 4)}px`;
+    function drainAuxiliary() {
+      if (auxiliaryActive || leaving) return;
+      const task=auxiliary.shift();
+      if(task) void start(task.control,task.mode,task);
     }
+    function releaseQueuedAux(task){void task.prepared.catch(()=>{}).then(async()=>{for(const release of task.holds)try{await release();}catch(error){message(task.control,'缓存保护更新失败，清理将在页面恢复后重试。',true);}});}
     function makeControl(parent, entry, batch = false) {
       const host = document.createElement('span'); host.setAttribute('data-replay-list-control', batch ? 'all' : 'row');
       const shadow = host.attachShadow({mode: 'closed'}), style = document.createElement('style'); style.textContent = css; shadow.append(style);
-      const wrap = document.createElement('div'); wrap.className = 'controls';
+      const wrap = document.createElement('div'); wrap.className = 'controls'; wrap.dataset.batch = String(batch);
       wrap.innerHTML = `<span class="metrics" hidden><span class="speed">— MB/s</span><br><span class="remaining">剩余 —</span></span>
         <button class="main" type="button">${batch ? '下载全部' : '下载'}</button>
         <span class="ring" hidden role="progressbar" aria-label="${batch ? '全部录播进度' : '录播进度'}" aria-valuemin="0" aria-valuemax="100"><svg viewBox="0 0 34 34" aria-hidden="true"><circle class="track" cx="17" cy="17" r="12"/><circle class="fill" cx="17" cy="17" r="12" pathLength="100"/></svg><span class="percent"></span></span>
-        <details class="audio" hidden><summary>${batch ? '提取全部音频' : '提取音频'}</summary><div class="menu"><button type="button" data-format="aac" title="保留原始 AAC，无需重新编码">AAC</button><button type="button" data-format="mp3" title="重新编码为 MP3，兼容性更好">MP3</button></div></details>
+        <button class="audio" type="button" hidden>保存音频</button>
         <button class="cancel" type="button" hidden>取消</button><span class="warning" hidden aria-label="任务失败">!</span><span class="message" role="status" aria-live="polite"></span>`;
       shadow.append(wrap); parent.append(host);
       const control = {host, wrap, batch, entry, complete: false};
       for (const name of ['main','ring','fill','percent','audio','cancel','warning','message','metrics','speed','remaining']) control[name] = shadow.querySelector(`.${name}`);
-      if (batch) { host.style.setProperty('--primary-width', '90px'); host.style.setProperty('--secondary-width', '130px'); }
-      control.summary = shadow.querySelector('summary');
-      control.audio.addEventListener('toggle', () => positionMenu(control));
-      control.main.onclick = () => start(control, (batch ? control.complete : entry.video) ? 'resave' : 'video');
-      control.summary.onclick = event => { if (active) event.preventDefault(); };
-      for (const button of control.audio.querySelectorAll('button')) button.onclick = () => { control.audio.open = false; start(control, button.dataset.format); };
+      host.style.setProperty('--primary-width', batch ? '90px' : '78px'); host.style.setProperty('--secondary-width', batch ? '130px' : '82px');
+      control.main.onclick = () => start(control, (batch ? selectedEntries(control).every(item => satisfied(item, settings())) : entry.video) ? 'resave' : 'video');
+      control.audio.onclick = () => start(control, settings().audioFormat);
       control.cancel.onclick = () => {
-        const index = pending.findIndex(task => task.control === control);
-        if (index !== -1) { pending.splice(index, 1); message(control, '已取消排队。'); }
-        else if (active) { active.cancelling = true; active.controller.abort(); }
+        const queuedAux=auxiliary.findIndex(task=>task.control===control);
+        if(queuedAux!==-1){const task=auxiliary.splice(queuedAux,1)[0];task.controller.abort();releaseQueuedAux(task);message(control,'已取消排队。');renderAll();return;}
+        if(auxiliaryActive?.control===control){auxiliaryActive.cancelling=true;auxiliaryActive.controller.abort();renderAll();return;}
+        const task = waitingTask(control);
+        if (task) {
+          if (task.control === control) pending.splice(pending.indexOf(task), 1);
+          else { task.list = task.list.filter(entry => entry !== control.entry); if (!task.list.length) pending.splice(pending.indexOf(task), 1); }
+          message(control, '已取消排队。');
+        } else if (waitingInBatch(control)) { active.skipped.add(control.entry); message(control, '已取消排队。'); }
+        else if (active) {
+          if (!control.batch && active.control.batch) { active.rowCancelling = true; active.currentController.abort(); }
+          else { active.cancelling = true; active.controller.abort(); }
+        }
         renderAll();
       };
       controls.add(control); render(control); return control;
@@ -1929,6 +2050,7 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       const course = document.title.replace(/^.*?[–—]\s*/, '').replace(/[（(][^()（）]*学期[^()（）]*[）)]\s*$/, '').trim();
       return cleanName(`${course}${row.querySelector('th[scope="row"]')?.textContent.trim() || ''}`);
     }
+    function matchWatchColor(entry,link){const color=document.defaultView?.getComputedStyle?.(link).color;if(color)entry.control.host.style.setProperty('--watch-color',color);}
     function reserveLayout() {
       if (!table) return;
       const container = table.parentElement;
@@ -1952,21 +2074,22 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       }
       // Decide from the table's content and containing width, never from an
       // active button's size. All row states use the same reserved grid tracks.
-      const showMetrics = availableWidth - contentWidth >= 326;
+      const showMetrics = availableWidth - contentWidth >= 338;
       for (const entry of entries.values()) {
         entry.control.wrap.dataset.metrics = String(showMetrics);
         entry.control.metrics.hidden = !showMetrics;
-        entry.control.host.style.width = `${showMetrics ? 306 : 178}px`;
+        entry.control.host.style.width = `${showMetrics ? 318 : 190}px`;
         const cell = entry.control.host.parentElement;
-        cell.style.width = cell.style.minWidth = `${(showMetrics ? 306 : 178) + 20}px`;
+        cell.style.width = cell.style.minWidth = `${(showMetrics ? 318 : 190) + 20}px`;
       }
       const heading = table.querySelector('[data-replay-list-heading]');
       if (heading) {
-        heading.style.cssText = `box-sizing:border-box;text-align:left;padding:8px 10px;width:${showMetrics ? 326 : 198}px;`;
+        heading.style.cssText = `box-sizing:border-box;text-align:left;padding:8px 10px;width:${showMetrics ? 338 : 210}px;`;
         heading.style.paddingLeft = `${showMetrics ? 138 : 10}px`;
       }
       if (bottom) {
-        const wide = (bottom.host.parentElement.clientWidth || availableWidth) >= 398;
+        const optionWidth=choices?[...choices.children].filter(item=>!item.hidden).reduce((sum,item)=>sum+(item.getBoundingClientRect?.().width||parseFloat(item.style.minWidth)||(item.tagName==='BUTTON'?90:Math.min(96,item.textContent.length*13)))+8,0):0;
+        const wide = (bottom.host.parentElement.clientWidth || availableWidth)-optionWidth >= 406;
         bottom.wrap.dataset.metrics = String(wide); bottom.metrics.hidden = !wide;
         bottom.host.style.width = `${wide ? 378 : 250}px`;
       }
@@ -1986,6 +2109,7 @@ const require = name => { if (name === './progress-estimate.js') return Progress
         const previous = [...entries.values()].find(entry => entry.row === row && entry.control.host.isConnected);
         if (previous) {
           if (previous.watchURL !== watch.href) { entries.delete(previous.watchURL); previous.watchURL = watch.href; entries.set(watch.href, previous); }
+          matchWatchColor(previous,link);
           continue;
         }
         let entry = entries.get(watch.href);
@@ -1996,6 +2120,7 @@ const require = name => { if (name === './progress-estimate.js') return Progress
         if (!entry) { entry = {watchURL: watch.href, title: rowTitle(row), row}; entries.set(watch.href, entry); }
         else { controls.delete(entry.control); entry.row = row; }
         entry.control = makeControl(cell, entry);
+        matchWatchColor(entry,link);
       }
       const header = table.querySelector('thead tr');
       if (header && !header.querySelector('[data-replay-list-heading]')) {
@@ -2006,7 +2131,17 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       if (!bottom?.host.isConnected) {
         if (bottom) controls.delete(bottom);
         const bar = document.createElement('div'); bar.setAttribute('data-replay-list-bar', '');
-        bar.style.cssText = 'display:flex;justify-content:flex-end;border-top:1px solid #e4eaf4;padding:12px 10px;margin-top:10px;';
+        bar.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:8px;border-top:1px solid #e4eaf4;padding:12px 10px;margin-top:10px;';
+        choices = document.createElement('span'); choices.setAttribute('data-replay-list-options', '');
+        choices.style.cssText = 'display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px;margin-right:auto;';
+        choices.innerHTML = '<span>下载设置：</span><select class="content" aria-label="下载内容"><option value="video">仅视频（有声音）</option><option value="audio">仅音频</option><option value="both">视频和音频</option></select><select class="format" aria-label="视频格式" title="HLS 输出格式；直接提供 MP4 的录播请选择 MP4"><option value="mp4">MP4（推荐）</option><option value="fmp4">fMP4（分片 MP4）</option><option value="ts">TS（原始分片）</option></select><select class="audioformat" aria-label="音频格式" title="AAC 无需重新编码；MP3 兼容性更好"><option value="aac">AAC (.m4a)</option><option value="mp3">MP3 (.mp3)</option></select><button class="directory" type="button" hidden>选择保存目录</button><span class="directory-name"></span>';
+        for (const select of choices.querySelectorAll('select')) { select.style.cssText = 'font:13px system-ui;padding:6px 8px;min-width:132px;height:34px;border:1px solid #d6dde8;border-radius:6px;background:white;color:#32445f;'; select.onchange = () => { renderAll(); reserveLayout(); }; }
+        choices.querySelector('.content').style.minWidth='180px';
+        const folderButton=choices.querySelector('.directory');folderButton.style.cssText='font:12px system-ui;padding:5px 8px;background:none;border:1px solid #d6dde8;border-radius:6px;color:#32445f;';
+        folderButton.onclick=async()=>{try{await FileOutput.prepareDestination(true);}catch(error){if(error.name!=='AbortError')message(bottom,errorMessage(error),true);}};
+        const folderName=choices.querySelector('.directory-name');folderName.style.cssText='max-width:96px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;';
+        FileOutput.watchDestination(info=>{folderButton.hidden=!info.supported;folderButton.textContent=info.selected?'更改目录':'选择保存目录';folderName.textContent=folderName.title=info.name;});
+        bar.append(choices);
         container.append(bar); bottom = makeControl(bar, null, true);
       }
       const visible = [...entries.values()].filter(entry => entry.row.isConnected);
@@ -2016,17 +2151,15 @@ const require = name => { if (name === './progress-estimate.js') return Progress
         if (!task.control.host.isConnected || !task.list.length) pending.splice(index, 1);
       }
       if (active?.current && !active.current.row.isConnected) { active.cancelling = true; active.controller.abort(); }
+      if(auxiliaryActive && !auxiliaryActive.control.host.isConnected)auxiliaryActive.controller.abort();
+      for(let index=auxiliary.length-1;index>=0;index--)if(!auxiliary[index].control.host.isConnected){const task=auxiliary.splice(index,1)[0];task.controller.abort();releaseQueuedAux(task);}
       // Also handle sorting/pagination without duplicating buttons or headers.
       renderAll();
       reserveLayout();
-      for (const control of controls) positionMenu(control);
     }
     const selectedEntries = control => control.batch ? [...entries.values()].filter(entry => entry.row.isConnected) : [control.entry];
     async function browserSave(file, filename, signal) {
-      signal.throwIfAborted();
-      const url = URL.createObjectURL(file), link = document.createElement('a');
-      try { link.href = url; link.download = filename; link.hidden = true; document.body.append(link); link.click(); }
-      finally { link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000); }
+      return FileOutput.saveFile(file,filename,signal);
     }
     function pickFiles(signal, multiple) {
       return new Promise((resolve, reject) => {
@@ -2043,18 +2176,18 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       if (sink) try { await sink.abort(); } catch (cleanupError) { throw FileOutput.withCleanupFailure(error, cleanupError, sink.type === 'browser-download'); }
       throw error;
     }
-    async function download(entry, job, update) {
-      const signal = job.controller.signal, filename = `${entry.title}.mp4`;
+    async function download(entry, job, update, saveVideo = true) {
+      const signal = job.currentController.signal;
+      const format = saveVideo ? job.options.videoFormat : 'mp4';
+      const filename = `${entry.title}${format === 'fmp4' ? '-fMP4' : ''}.${format === 'ts' ? 'ts' : 'mp4'}`;
       let sink, committed = false;
       try {
-        // For a single row, open the picker synchronously from the click.
-        // Batch jobs use the same OPFS handoff on every browser, without a
-        // separate save-location prompt for each recording.
-        sink = await FileOutput.createHlsOutput(filename, 'mp4', signal, () => {}, {browserDownload: job.browserDownload});
+        // Allocate the output before source resolution so cancellation follows
+        // the same rollback path; an audio-only intermediate always uses MP4.
+        sink = await FileOutput.createHlsOutput(filename, format, signal, () => {}, {browserDownload: job.browserDownload, cacheOnly: !saveVideo});
         const source = await resolveSource(entry, signal); signal.throwIfAborted();
-        job.currentEstimate = createEstimate();
+        if (source.kind === 'mp4' && format !== 'mp4') throw new Error('此录播直接提供 MP4 文件，请选择 MP4 视频格式。');
         const report = ({done,total,bytes}) => {
-          job.currentEstimate.note(done/total, bytes);
           update(done/total, `${(bytes/1048576).toFixed(1)} MB`, bytes);
         };
         if (source.kind === 'mp4') {
@@ -2072,13 +2205,18 @@ const require = name => { if (name === './progress-estimate.js') return Progress
             if (!start && !['ftyp','moov','free','wide'].includes(String.fromCharCode(...bytes.subarray(4,8)))) throw new Error('服务器返回的内容不是 MP4。');
             await sink.write(bytes); report({done:end+1,total,bytes:end+1});
           }
-        } else await Core.download({url: source.url, format: 'mp4', sink, request: job.request, muxjs, mp4Writer, signal, onProgress: report});
+        } else await Core.download({url: source.url, format, sink, request: job.request, muxjs, mp4Writer, signal, onProgress: report});
         signal.throwIfAborted(); await sink.close(); committed = true;
-        entry.video = {sink, filename}; entry.localFile = null; entry.needsFile = false;
+        entry.video = {sink, filename, saved: saveVideo}; entry.localFile = null; entry.needsFile = false;
       } catch (error) { if (!committed) await rollback(sink, error); throw error; }
     }
     async function extract(entry, format, job, update) {
-      const signal = job.controller.signal, filename = entry.video.filename.replace(/\.mp4$/i, '') + (format === 'aac' ? '.m4a' : '.mp3');
+      const signal = job.currentController.signal, filename = entry.video.filename.replace(/(?:-fMP4)?\.(?:mp4|ts)$/i, '') + (format === 'aac' ? '.m4a' : '.mp3');
+      const cached = entry.audio?.[format];
+      if (cached?.sink.fileAvailable) {
+        try{await cached.sink.withFile(file => browserSave(file, filename, signal)); update(1, '音频已再次保存。'); return;}
+        catch(error){if(error.name!=='NotFoundError')throw error;delete entry.audio[format];}
+      }
       let sink, committed = false;
       try {
         sink = await FileOutput.createHlsOutput(filename, format, signal, () => {}, {browserDownload: job.browserDownload});
@@ -2087,104 +2225,153 @@ const require = name => { if (name === './progress-estimate.js') return Progress
           async write(bytes) { await sink.write(bytes); written += bytes.byteLength; },
           async writeAt(bytes, position) { await sink.writeAt(bytes, position); written = Math.max(written, position + bytes.byteLength); },
         };
-        job.currentEstimate = createEstimate();
         const convert = file => AudioExport.convert({file, format, sink: output, muxjs, mp4Writer, reader: AudioReader, encoderFactory, signal,
           onProgress({progress: value,packets}) {
-            job.currentEstimate.note(value, written);
             update(value, `${format.toUpperCase()} · ${packets} 个音频包`, written);
           }});
         if (entry.localFile) await convert(entry.localFile); else await entry.video.sink.withFile(convert);
         signal.throwIfAborted(); await sink.close(); committed = true;
+        (entry.audio ||= {})[format] = {sink, filename};
       } catch (error) { if (!committed) await rollback(sink, error); throw error; }
     }
     async function start(control, mode, queuedTask) {
-      if (leaving || pending.some(task => task.control === control)) return;
-      const list = queuedTask?.list || (mode === 'video' ? downloadable(control) : selectedEntries(control));
-      if (!list.length) return;
-      if (active) {
-        if (mode !== 'video' || active.control === control) return;
-        // Only metadata is queued; no background player, request or file is
-        // opened until the preceding job has finished its cleanup.
-        pending.push({control, mode, list}); renderAll(); return;
+      if (leaving || pending.some(task => task.control === control) || auxiliary.some(task=>task.control===control)) return;
+      let options = queuedTask?.options || settings();
+      if(!control.batch && mode!=='video' && !available(control.entry) && !control.entry.video?.saved && !control.entry.audio?.[mode]?.sink.fileAvailable){
+        options={...options,content:mode==='resave'?'video':'audio',audioFormat:mode==='resave'?options.audioFormat:mode};mode='video';
       }
-      // A queued task no longer has a user activation for a native picker.
-      // Use the existing browser-download path rather than opening it late.
-      const job = active = {control, list, controller: new AbortController(), request, browserDownload: control.batch || Boolean(queuedTask), started: performance.now(), current: null, cancelling: false, holds: []};
+      const aux = !control.batch && mode!=='video';
+      const list = queuedTask?.list || (mode === 'video' ? downloadable(control, options) : selectedEntries(control));
+      if (!list.length) return;
+      if(aux && auxiliaryActive){
+        if(auxiliaryActive.control===control)return;
+        const controller=new AbortController(),holds=[];
+        if(available(control.entry) && control.entry.video.sink.holdHandoff)holds.push(control.entry.video.sink.holdHandoff());
+        const needsFile=!available(control.entry)&&control.entry.video?.saved&&!control.entry.audio?.[mode]?.sink.fileAvailable;
+        const prepared=needsFile?pickFiles(controller.signal,false).then(files=>{control.entry.localFile=files[0];}):Promise.resolve();
+        prepared.catch(()=>{});auxiliary.push({control,mode,list,options,controller,holds,prepared});renderAll();return;
+      }
+      if (!aux && active) {
+        if (mode !== 'video' || active.control === control) return;
+        pending.push({control, mode, list, options}); renderAll(); return;
+      }
+      const job = {control, list, options, controller: queuedTask?.controller || new AbortController(), request,
+        browserDownload: control.batch || Boolean(queuedTask) || (mode === 'video' && options.content !== 'video'),
+        index: -1, current: null, cancelling: false, skipped: new Set(), finished:new Set(), holds: queuedTask?.holds || [], heldSources: new Set(), temporarySources:new Set()};
+      if(aux)auxiliaryActive=job;else active=job;
+      const holdSource = entry => {
+        if (!entry.localFile && available(entry) && entry.video?.sink.holdHandoff && !job.heldSources.has(entry.video.sink)) {
+          job.holds.push(entry.video.sink.holdHandoff()); job.heldSources.add(entry.video.sink);
+        }
+      };
       job.batchEstimate = createEstimate(); job.completedBytes = 0;
       const updateEstimates = () => {
         if (job.current) estimate(job.current.control, job.currentEstimate?.read() || {speed:null,remaining:Infinity});
         if (control.batch) estimate(control, job.batchEstimate.read());
       };
       job.estimateTimer = setInterval(updateEstimates, 1000);
-      onJob(job.controller, ({attempt,delay}) => {
+      job.retry = ({attempt,delay}) => {
         const text = `${Math.ceil(delay/1000)} 秒后重试（${attempt}/8）`;
         message(control, text); if (job.current) message(job.current.control, text);
-      });
+      };notifyJobs();
       message(control, ''); renderAll(); progress(control, null, '正在准备…');
       let wakeLock;
       try {
-        // A single chooser handles expired source copies for a whole batch.
-        if (mode !== 'video') {
-          const missing = list.filter(entry => !available(entry));
-          // Selecting an expired source is a separate user gesture. Use OPFS
-          // afterwards rather than chaining a second native permission picker.
+        for(const entry of list)if(available(entry))holdSource(entry);
+        await FileOutput.prepareDestination();job.controller.signal.throwIfAborted();
+        if(queuedTask?.prepared)await queuedTask.prepared;
+        if (mode !== 'video' || options.content !== 'video') {
+          const missing = list.filter(entry => !available(entry) && entry.video?.saved && !entry.audio?.[mode]?.sink.fileAvailable);
           if (missing.length) job.browserDownload = true;
           const files = missing.length ? await pickFiles(job.controller.signal, control.batch) : [];
           for (const entry of missing) {
             const file = control.batch ? files.find(file => file.name === entry.video?.filename) : files[0];
             if (!file) throw new Error('未选择全部待处理的视频。'); entry.localFile = file;
           }
-          for (const entry of list) if (!entry.localFile && entry.video?.sink.holdHandoff) job.holds.push(entry.video.sink.holdHandoff());
+          for (const entry of list) if (available(entry)) holdSource(entry);
         }
-        // Do not await a wake-lock permission before opening a native picker:
-        // it must still run directly from the user's download/menu click.
         try { void navigator.wakeLock?.request('screen').then(lock => {
-          if (active === job && !job.controller.signal.aborted) wakeLock = lock;
+          if ((active === job || auxiliaryActive === job) && !job.controller.signal.aborted) wakeLock = lock;
           else void lock.release().catch(() => {});
         }).catch(() => {}); } catch { /* Optional. */ }
         for (let index = 0; index < list.length; index++) {
-          const entry = list[index]; job.controller.signal.throwIfAborted(); job.current = entry; job.started = performance.now(); job.currentEstimate = null; job.entryBytes = 0;
+          const entry = list[index]; job.controller.signal.throwIfAborted(); job.index = index;
+          if (job.skipped.has(entry)) continue;
+          job.current = entry; job.rowCancelling = false; job.entryBytes = 0; job.currentEstimate = createEstimate();job.rowHolds=[];
+          job.currentController = new AbortController();
+          const abortRow = () => job.currentController.abort(job.controller.signal.reason);
+          job.controller.signal.addEventListener('abort', abortRow, {once:true});
           message(entry.control, ''); renderAll();
+          let stage = 0, baseBytes = 0, stageBytes = 0;
+          const wantsAudio = mode === 'video' ? options.content !== 'video' : !['resave'].includes(mode);
+          const cachedAudio = !['video','resave'].includes(mode) && entry.audio?.[mode]?.sink.fileAvailable;
+          const needsSource = !cachedAudio && (!entry.video || (!available(entry) && !entry.video.saved));
+          const stageCount = needsSource && wantsAudio ? 2 : 1;
           const update = (value, text, bytes) => {
+            const mapped = value === null ? null : (stage + value) / stageCount;
             if (bytes !== undefined) {
-              job.entryBytes = bytes;
-              job.batchEstimate.note((index+value)/list.length, job.completedBytes+bytes);
+              stageBytes = bytes; job.entryBytes = baseBytes + bytes;
+              job.currentEstimate.note(mapped, job.entryBytes);
+              job.batchEstimate.note((index + mapped)/list.length, job.completedBytes + job.entryBytes);
             }
-            progress(entry.control, value, text);
-            if (control.batch) progress(control, value === null ? index/list.length : (index+value)/list.length, `${index+1}/${list.length} · ${text}`);
+            progress(entry.control, mapped, text);
+            if (control.batch) progress(control, mapped === null ? index/list.length : (index+mapped)/list.length, `${index+1}/${list.length} · ${text}`);
             updateEstimates();
           };
-          update(null, mode === 'video' ? '正在验证登录态…' : mode === 'resave' ? '正在重新保存…' : '正在提取音频…');
-          if (mode === 'video') {
-            await download(entry, job, update);
-            if (control.batch && entry.video.sink.holdHandoff) job.holds.push(entry.video.sink.holdHandoff());
-          } else if (mode === 'resave') {
-            const save = file => browserSave(file, entry.video.filename, job.controller.signal);
-            if (entry.localFile) await save(entry.localFile); else await entry.video.sink.withFile(save);
-          } else await extract(entry, mode, job, update);
-          update(1, mode === 'video' ? '视频已保存；临时副本将在 5 分钟后清理。' : mode === 'resave' ? '已重新保存。' : '音频已保存。');
-          job.completedBytes += job.entryBytes;
-          if (control.batch) { job.current = null; render(entry.control); }
+          update(null, '正在准备…');
+          let settled = false;
+          try {
+            if (needsSource) {
+              await download(entry, job, update, mode === 'resave' || (mode === 'video' && options.content !== 'audio'));
+              if(FileOutput.destinationInfo().selected && !entry.video.saved)job.temporarySources.add(entry.video.sink);
+              if(FileOutput.destinationInfo().selected){if(wantsAudio && entry.video.sink.holdHandoff)job.rowHolds.push(entry.video.sink.holdHandoff());}
+              else if (control.batch || wantsAudio) holdSource(entry);
+              if (wantsAudio) { stage++; baseBytes += stageBytes; }
+            } else if (mode === 'resave' || (mode === 'video' && options.content !== 'audio' && !entry.video.saved)) {
+              const save = async file => {const output=await browserSave(file, entry.video.filename, job.currentController.signal);if(output?.type==='directory')entry.video.sink=output;};
+              if (entry.localFile) await save(entry.localFile); else await entry.video.sink.withFile(save);
+              entry.video.saved = true;
+            }
+            if (wantsAudio) {
+              if(!FileOutput.destinationInfo().selected || !needsSource)holdSource(entry);
+              await extract(entry, mode === 'video' ? options.audioFormat : mode, job, update);
+            }
+            progress(entry.control, 1, FileOutput.destinationInfo().selected?'已保存至所选目录。':'已保存；临时副本将在 5 分钟后清理。');
+            if (control.batch) progress(control, (index+1)/list.length, `${index+1}/${list.length}`);
+            job.completedBytes += job.entryBytes; settled = true;job.finished.add(entry);
+          } catch (error) {
+            if (!job.controller.signal.aborted && job.currentController.signal.aborted && !error.cleanupFailed) {
+              settled = true; job.skipped.add(entry); message(entry.control, '已取消；未完成的临时文件已清理。');
+            } else throw error;
+          } finally {
+            job.controller.signal.removeEventListener('abort', abortRow);
+            for(const release of job.rowHolds)await release();
+            if(FileOutput.destinationInfo().selected && !entry.video?.saved && entry.video?.sink.dispose){await entry.video.sink.dispose();job.temporarySources.delete(entry.video.sink);}
+            if (control.batch && settled) { job.current = null; renderAll(); }
+          }
         }
         message(control, '已完成。');
       } catch (caught) {
         if (caught.name === 'NotFoundError' && job.current) job.current.needsFile = true;
         const error = caught.cleanupFailed ? caught : job.controller.signal.aborted ? job.controller.signal.reason || caught : caught;
         const cancelled = error.name === 'AbortError';
-        if (!cancelled || error.cleanupFailed) clearPending('队列已停止，请重试。');
+        if(FileOutput.destinationInfo().supported&&!FileOutput.destinationInfo().selected)clearPending('未选择保存目录，队列已取消。');
+        if ((!cancelled || error.cleanupFailed) && !aux) clearPending('队列已停止，请重试。');
         const cleanup = error.cleanupFailed ? (error.cleanupRecovery ? '临时文件待清理，页面恢复后重试。' : '撤销写入失败，请检查目标文件。') : '未完成的临时文件已清理。';
         const text = cancelled ? `已取消；${cleanup}` : `${errorMessage(error)} ${cleanup}`;
         message(control, text, !cancelled || error.cleanupFailed); if (job.current) message(job.current.control, text, !cancelled || error.cleanupFailed);
       } finally {
         clearInterval(job.estimateTimer);
         for (const release of job.holds) try { await release(); } catch (error) { message(control, '临时副本未能继续保留；重存时请选择已保存的视频。', true); }
+        for(const sink of job.temporarySources)try{await sink.dispose();}catch(error){message(control,'临时源文件待清理，页面恢复后重试。',true);}
         void wakeLock?.release().catch(() => {});
-        job.current = null; active = null; onJob(null); renderAll(); drain();
+        job.current = null;if(aux)auxiliaryActive=null;else active=null;notifyJobs();renderAll();drain();drainAuxiliary();
       }
     }
-    document.addEventListener('scroll', () => { for (const control of controls) positionMenu(control); }, true);
     for (const event of ['pagehide', 'beforeunload']) window.addEventListener(event, () => {
-      leaving = true; clearPending('页面已离开，排队已取消。'); active?.controller.abort(); renderAll();
+      leaving = true; clearPending('页面已离开，排队已取消。');active?.controller.abort();auxiliaryActive?.controller.abort();
+      for(const task of auxiliary.splice(0)){task.controller.abort();releaseQueuedAux(task);}
+      renderAll();
     });
     window.addEventListener('pageshow', () => { leaving = false; renderAll(); });
     return {refresh};
@@ -2434,7 +2621,7 @@ return module.exports; })();
     :host { display: block !important; color-scheme: light; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
     button, select, input, a { font: inherit; box-sizing: border-box; }
     button, .save { border: 0; border-radius: 6px; padding: 8px 12px; background: #1268cf; color: white; cursor: pointer; text-decoration: none; }
-    button:disabled { opacity: .5; cursor: wait; }
+    button:disabled { opacity: .5; cursor: wait; } select:disabled { opacity: .45; background: #f1f3f5; cursor: default; }
     .panel { background: #f6f8fb; color: #18212d; border: 1px solid #dce2ea; border-radius: 10px; padding: 14px 16px; box-sizing: border-box; width: 100%; }
     p { line-height: 1.5; margin: 8px 0 0; }
     label { display: block; margin: 12px 0; } input, select { width: 100%; margin-top: 5px; padding: 8px; border: 1px solid #b4bdc8; border-radius: 6px; color: #18212d; background: #fff; }
@@ -2497,17 +2684,22 @@ return module.exports; })();
     container.innerHTML = `
       <div class="toolbar"><button class="start">下载完整视频</button>
         <button class="sample secondary">下载前 5 分钟测试</button>
-        <select class="format" aria-label="保存格式"><option value="mp4">MP4（推荐）</option><option value="fmp4">fMP4（分片 MP4）</option><option value="ts">TS（原始分片）</option></select>
+        <span>下载设置：</span><select class="content" aria-label="下载内容"><option value="video">仅视频（有声音）</option><option value="audio">仅音频</option><option value="both">视频和音频</option></select>
+        <select class="format" aria-label="视频格式"><option value="mp4">MP4（推荐）</option><option value="fmp4">fMP4（分片 MP4）</option><option value="ts">TS（原始分片）</option></select>
+        <select class="audioformat" aria-label="音频格式"><option value="aac">AAC (.m4a，无需重新编码)</option><option value="mp3">MP3 (.mp3，兼容性更好)</option></select>
         <button class="cancel secondary" hidden>取消</button></div>
       <div class="progress-label"><span>下载进度</span><span class="percent">0%</span></div>
       <progress value="0" max="1" aria-label="下载进度"></progress>
       <p class="status" aria-live="polite">请先播放视频，检测到地址后即可下载。</p>
       <p class="metrics">0 MB · 速度 — · 剩余时间 —</p>
       <p class="notice">MP4 兼容性较好；TS / fMP4 在 QuickTime 等播放器中可能无法正常播放。下载过程中请保持页面打开。</p>
+      <div class="directory-tools toolbar" hidden style="margin:10px 0 0"><button class="directory secondary">选择保存目录</button><span class="directory-name"></span></div>
+      <div class="cache-controls toolbar" style="margin:10px 0 0"><span>缓存保留</span><select class="retention" aria-label="缓存保留时间"><option value="300000">5 分钟</option><option value="600000">10 分钟</option><option value="1800000">30 分钟</option><option value="3600000">60 分钟</option><option value="43200000">12 小时</option><option value="86400000">24 小时</option><option value="0">永不删除</option></select></div>
+      <p class="cache-note notice"></p>
       <div class="toolbar" style="margin:10px 0 0"><button class="copy secondary">复制播放地址</button><label style="margin:0"><input class="rename" type="checkbox" checked style="width:auto;margin:0"> 使用课程信息命名</label></div>
       <div class="audio-tools toolbar" hidden style="margin:10px 0 0">
+        <button class="video">保存视频</button>
         <button class="audio">保存音频</button>
-        <select class="audioformat" aria-label="音频格式"><option value="mp3">MP3（兼容性更好）</option><option value="aac">AAC（无需重新编码）</option></select>
       </div>
       <p class="audio-note notice" hidden>MP3 兼容性更好，需要重新编码；AAC 保存为 .m4a，保留原始音频编码。</p>
       <details class="audio-debug" hidden><summary>音频调试信息（临时）</summary>
@@ -2524,7 +2716,11 @@ return module.exports; })();
     shadow.append(container);
     positionHost(host, anchor);
     const panel = { host };
-    for (const name of ['sources', 'url', 'format', 'status', 'start', 'sample', 'cancel', 'percent', 'settings', 'metrics', 'notice', 'copy', 'rename', 'audio', 'audioformat']) panel[name] = shadow.querySelector(`.${name}`);
+    for (const name of ['sources', 'url', 'format', 'status', 'start', 'sample', 'cancel', 'percent', 'settings', 'metrics', 'notice', 'copy', 'rename', 'audio', 'audioformat', 'content', 'retention', 'video']) panel[name] = shadow.querySelector(`.${name}`);
+    panel.cacheNote = shadow.querySelector('.cache-note');
+    panel.directory=shadow.querySelector('.directory');
+    panel.directory.onclick=async()=>{if(activeJob)return;try{await FileOutput.prepareDestination(true);}catch(error){if(error.name!=='AbortError')panel.status.textContent=errorMessage(error);}};
+    FileOutput.watchDestination(info=>{shadow.querySelector('.directory-tools').hidden=!info.supported;shadow.querySelector('.cache-controls').hidden=info.supported;panel.cacheNote.hidden=info.supported;panel.directory.textContent=info.selected?'更改保存目录':'选择保存目录';shadow.querySelector('.directory-name').textContent=info.name;});
     // The two re-save links share the .save style class; bind each explicitly.
     panel.audiosave = shadow.querySelector('.audiosave');
     panel.save = shadow.querySelector('.videosave');
@@ -2542,9 +2738,20 @@ return module.exports; })();
     panel.start.onclick = () => startDownload(panel);
     panel.sample.onclick = () => startDownload(panel, 300);
     panel.audio.onclick = () => saveAudio(panel);
+    panel.video.onclick = () => saveVideo(panel);
+    panel.audioformat.onchange = () => updateSavedButtons(panel);
+    panel.content.onchange = () => { updateStartLabel(panel); updateFormatControls(panel); };
+    panel.retention.onchange = () => {
+      try {
+        for (const output of [panel.completed?.sink, ...Object.values(panel.completed?.audio || {}).map(item => item.sink)]) output?.setRetention(Number(panel.retention.value));
+        updateCacheNote(panel);
+        panel.status.textContent = panel.status.textContent.replace(/临时副本将在 \d+ (?:分钟|小时)后清理|浏览器缓存不会自动删除/g, cacheText(panel));
+      } catch (error) { panel.status.textContent = errorMessage(error); }
+    };
+    updateCacheNote(panel);
     panel.audioInput.onchange = () => {
       const file = panel.audioInput.files?.[0];
-      if (file && panel.completed) { panel.localAudioFile = file; panel.status.textContent = '已选择视频，请点击“保存音频”开始。'; }
+      if (file && panel.completed) { panel.localAudioFile = file; panel.status.textContent = '已选择视频，请点击“保存视频”或“保存音频”。'; }
       panel.audioInput.value = '';
     };
     panel.cancel.onclick = () => activeJob?.abort();
@@ -2552,7 +2759,8 @@ return module.exports; })();
       try { await navigator.clipboard.writeText(panel.url.value); panel.status.textContent = '播放地址已复制。'; }
       catch { panel.settings.open = true; panel.url.select?.(); panel.status.textContent = '无法自动复制，请在播放地址栏中手动复制。'; }
     };
-    panel.start.disabled = panel.sample.disabled = panel.audio.disabled = Boolean(activeJob);
+    panel.start.disabled = panel.sample.disabled = panel.audio.disabled = panel.video.disabled = Boolean(activeJob);
+    panel.content.disabled = Boolean(activeJob); updateFormatControls(panel);
     panels.add(panel); updateSources();
     return panel;
   }
@@ -2570,6 +2778,43 @@ return module.exports; })();
     if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
     return `${Math.floor(seconds / 60)} 分 ${Math.ceil(seconds % 60)} 秒`;
   }
+  function cacheText(panel) {
+    const value = Number(panel.retention.value);
+    return value === 0 ? '浏览器缓存不会自动删除' : `临时副本将在 ${value >= 3600000 * 12 ? value / 3600000 + ' 小时' : value / 60000 + ' 分钟'}后清理`;
+  }
+  function updateCacheNote(panel) { panel.cacheNote.textContent = `下载完成后，${cacheText(panel)}；已保存的文件不受影响。`; }
+  function updateSavedButtons(panel) {
+    panel.video.textContent = panel.completed?.saved ? '再次保存视频' : '保存视频';
+    panel.audio.textContent = panel.completed?.audio?.[panel.audioformat.value] ? '再次保存音频' : '保存音频';
+  }
+  function updateFormatControls(panel) {
+    panel.format.disabled = panel.content.disabled || panel.content.value === 'audio';
+    panel.audioformat.disabled = panel.content.disabled || panel.content.value === 'video';
+  }
+  function updateStartLabel(panel) {
+    panel.start.textContent = `${panel.completed ? '重新下载' : '下载'}${panel.content.value === 'audio' ? '音频' : panel.content.value === 'both' ? '视频和音频' : '完整视频'}`;
+  }
+  async function offerFile(file, filename, signal) {
+    return FileOutput.saveFile(file,filename,signal);
+  }
+  async function saveVideo(panel) {
+    if (activeJob || !panel.completed) return;
+    const source = panel.completed;
+    if (!panel.localAudioFile && source.sink.fileAvailable === false && !source.saved) return startDownload(panel, source.maxDuration, 'video');
+    if (!panel.localAudioFile && source.sink.fileAvailable === false) {
+      panel.status.textContent = '视频缓存已清理，请选择已保存的视频后再次点击保存。'; panel.audioInput.click(); return;
+    }
+    const job = activeJob = new AbortController();
+    for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = item.video.disabled = true;
+    panel.cancel.hidden = false;
+    try {
+      await FileOutput.prepareDestination();job.signal.throwIfAborted();
+      const save = async file => {const output=await offerFile(file, source.filename, job.signal);if(output?.type==='directory')source.sink=output;};
+      if (panel.localAudioFile) await save(panel.localAudioFile); else await source.sink.withFile(save);
+      source.saved = true; panel.status.textContent = '视频已交给浏览器保存。'; updateSavedButtons(panel);
+    } catch (error) { panel.status.textContent = '视频保存失败：' + errorMessage(error); }
+    finally { activeJob = null; panel.cancel.hidden = true; for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = item.video.disabled = false; }
+  }
 
   function errorMessage(error) {
     if ([401, 403].includes(error.status)) return '登录态已失效，请重新登录、播放视频后重试。';
@@ -2580,19 +2825,22 @@ return module.exports; })();
     return error.message || '发生未知错误，请重新下载。';
   }
 
-  async function startDownload(panel, maxDuration) {
+  async function startDownload(panel, maxDuration, overrideContent) {
     if (activeJob) return;
     if (!panel.url.value.trim()) { panel.status.textContent = '请先播放视频，或在播放地址设置中填入 .m3u8 地址。'; panel.settings.open = true; return; }
     let url;
     try { url = Core.networkURL(panel.url.value.trim(), location.href); }
     catch (error) { panel.status.textContent = errorMessage(error); return; }
-    const format = panel.format.value;
+    const content = overrideContent || panel.content.value, wantsAudio = content !== 'video', saveVideoFile = content !== 'audio';
+    const format = saveVideoFile ? panel.format.value : 'mp4';
     const title = (observedTitles.get(url) || document.title || document.querySelector('.course-info__header')?.textContent || '录播').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || '录播';
     const filename = `${panel.rename.checked ? title : '录播'}${maxDuration ? '-5min-test' : ''}${format === 'fmp4' ? '-fMP4' : ''}.${format === 'ts' ? 'ts' : 'mp4'}`;
+    const previous = panel.completed?.filename === filename && panel.completed.url === url ? panel.completed : null;
     activeJob = new AbortController();
     const job = activeJob;
-    let sink, wakeLock, committed = false, stopSink, handoffUrl, estimateTimer;
-    for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = true;
+    let sink, wakeLock, committed = false, stopSink, handoffUrl, estimateTimer, releaseSource;
+    for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = item.video.disabled = true;
+    panel.content.disabled = panel.audioformat.disabled = panel.retention.disabled = true;
     panel.url.disabled = panel.sources.disabled = panel.format.disabled = panel.rename.disabled = true;
     panel.cancel.hidden = false; panel.save.hidden = true; panel.progress.value = 0;
     panel.completed = null; panel.localAudioFile = null; panel.audioTools.hidden = panel.audioNote.hidden = true;
@@ -2607,10 +2855,11 @@ return module.exports; })();
     };
     onRetry = ({ attempt, delay }) => { panel.status.textContent = `请求失败，${Math.ceil(delay / 1000)} 秒后重试（第 ${attempt}/8 次）；可取消下载。`; };
     try {
+      await FileOutput.prepareDestination();job.signal.throwIfAborted();
       sink = await FileOutput.createHlsOutput(filename, format, job.signal, link => {
-        if (link) { handoffUrl = link; panel.save.hidden = false; panel.save.href = link; panel.save.download = filename; }
+        if (link) { handoffUrl = link; panel.save.href = link; panel.save.download = filename; }
         else if (panel.save.href === handoffUrl) panel.save.hidden = true;
-      });
+      }, {browserDownload: wantsAudio, cacheOnly: !saveVideoFile, retentionMs: Number(panel.retention.value)});
       stopSink = () => { void sink.abort().catch(error => console.warn('[PKU-Replay-Saver] 文件回收待重试', error)); };
       job.signal.addEventListener('abort', stopSink, { once: true });
       job.signal.throwIfAborted();
@@ -2619,8 +2868,8 @@ return module.exports; })();
       estimateTimer = setInterval(updateMetrics, 1000);
       await Core.download({ url, request, sink, muxjs, mp4Writer, format, maxDuration, signal: job.signal,
         onProgress({ done, total, bytes }) {
-          panel.progress.max = total; panel.progress.value = done;
-          panel.percent.textContent = `${(100 * done / total).toFixed(1)}%`;
+          panel.progress.max = 1; panel.progress.value = done / total * (wantsAudio ? .85 : 1);
+          panel.percent.textContent = `${(100 * panel.progress.value).toFixed(1)}%`;
           downloaded = bytes; estimator.note(done / total, bytes); updateMetrics();
           panel.status.textContent = `正在下载视频分片 ${done}/${total}…`;
         },
@@ -2628,10 +2877,12 @@ return module.exports; })();
       job.signal.throwIfAborted();
       panel.status.textContent = '正在保存文件…';
       await sink.close(); committed = true;
-      panel.completed = {sink, filename}; panel.audioTools.hidden = panel.audioNote.hidden = false;
+      panel.completed = {sink, filename, url, saved: saveVideoFile || Boolean(previous?.saved), maxDuration, audio: previous?.audio || {}}; panel.audioTools.hidden = panel.audioNote.hidden = false;
+      updateSavedButtons(panel);
+      if (wantsAudio && sink.holdHandoff) releaseSource = sink.holdHandoff();
       const description = maxDuration ? '前 5 分钟测试片段' : '完整录播';
       panel.status.dataset.state = 'success';
-      panel.status.textContent = sink.type === 'file-picker' ? `${description}已保存。` : `${description}已交给浏览器保存，请查看下载列表；临时副本将在 5 分钟后清理。`;
+      panel.status.textContent = !saveVideoFile ? '正在准备提取音频…' : sink.type !== 'browser-download' ? `${description}已保存。` : `${description}已交给浏览器保存，请查看下载列表；${cacheText(panel)}。`;
     } catch (caughtError) {
       let error = job.signal.aborted ? job.signal.reason || caughtError : caughtError;
       if (caughtError.cleanupFailed && error !== caughtError) {
@@ -2653,25 +2904,34 @@ return module.exports; })();
       void wakeLock?.release().catch(() => {});
       onRetry = () => {}; activeJob = null;
       panel.url.disabled = panel.sources.disabled = panel.format.disabled = panel.rename.disabled = false;
+      panel.content.disabled = panel.retention.disabled = committed && wantsAudio; updateFormatControls(panel);
       panel.cancel.hidden = true;
-      for (const item of panels) { item.start.disabled = item.sample.disabled = item.audio.disabled = false; item.start.textContent = '重新下载完整视频'; }
+      for (const item of panels) { item.start.disabled = item.sample.disabled = item.audio.disabled = item.video.disabled = committed && wantsAudio; updateStartLabel(item); }
+    }
+    try { if (committed && wantsAudio && !job.signal.aborted) await saveAudio(panel, true); }
+    finally {
+      if (releaseSource) try { await releaseSource(); } catch (error) { panel.status.textContent += ' 缓存保留时间更新失败。'; }
+      if(committed && !saveVideoFile && FileOutput.destinationInfo().selected)try{await sink.dispose();}catch(error){panel.status.textContent+=' 临时源文件待清理，页面恢复后重试。';}
+      if(committed&&wantsAudio){activeJob=null;panel.content.disabled=panel.retention.disabled=false;updateFormatControls(panel);panel.cancel.hidden=true;for(const item of panels)item.start.disabled=item.sample.disabled=item.audio.disabled=item.video.disabled=false;}
     }
   }
 
-  async function saveAudio(panel) {
+  async function saveAudio(panel, automatic = false) {
     if (activeJob || !panel.completed) return;
     const source = panel.completed;
-    if (!panel.localAudioFile && (source.needsFile || source.sink.fileAvailable === false)) {
+    const format = panel.audioformat.value, cached = source.audio?.[format];
+    if (!cached?.sink.fileAvailable && !panel.localAudioFile && (source.needsFile || source.sink.fileAvailable === false)) {
+      if (!source.saved) return startDownload(panel, source.maxDuration, 'audio');
       panel.status.textContent = '视频临时副本已清理，请选择已经保存的视频，再点击“保存音频”。';
       panel.audioInput.click(); return;
     }
-    const format = panel.audioformat.value;
     const filename = source.filename.replace(/(?:-fMP4)?\.(?:mp4|ts)$/i, '') + (format === 'aac' ? '.m4a' : '.mp3');
     const job = activeJob = new AbortController();
     let sink, committed = false, stopSink, handoffUrl, estimateTimer;
-    for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = true;
-    panel.audioformat.disabled = true; panel.cancel.hidden = false; panel.status.dataset.state = 'active';
-    panel.audiosave.hidden = true; panel.progress.max = 1; panel.progress.value = 0; panel.percent.textContent = '0%';
+    for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = item.video.disabled = true;
+    panel.content.disabled = panel.retention.disabled = true;
+    panel.audioformat.disabled = panel.format.disabled = true; panel.cancel.hidden = false; panel.status.dataset.state = 'active';
+    panel.audiosave.hidden = true; panel.progress.max = 1; panel.progress.value = automatic ? .85 : 0; panel.percent.textContent = automatic ? '85%' : '0%';
     panel.metrics.textContent = '已处理 0 个音频包 · 剩余约 —';
     panel.status.textContent = '请选择音频保存位置…';
     const diagnostics = [];
@@ -2679,7 +2939,7 @@ return module.exports; })();
     const recordDiagnostic = value => {
       diagnostics.push(value);
       if (diagnostics.length > 100) diagnostics.splice(30, diagnostics.length - 100);
-      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.6.4-debug', events: diagnostics}, null, 2);
+      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.8.2-debug', events: diagnostics}, null, 2);
     };
     recordDiagnostic({stage: 'browser', userAgent: navigator.userAgent, selectedFormat: format,
       sandboxAudioDecoder: typeof globalThis.AudioDecoder, pageAudioDecoder: typeof page.AudioDecoder,
@@ -2690,18 +2950,26 @@ return module.exports; })();
     let processedPackets = 0;
     const updateMetrics = () => { panel.metrics.textContent = `已处理 ${processedPackets} 个音频包 · 剩余约 ${formatTime(estimator.read().remaining)}`; };
     try {
+      await FileOutput.prepareDestination();job.signal.throwIfAborted();
+      if (cached?.sink.fileAvailable) {
+        try{
+          await cached.sink.withFile(file => offerFile(file, filename, job.signal));
+          panel.progress.value = 1; panel.percent.textContent = '100%'; panel.status.dataset.state = 'success';
+          panel.status.textContent = FileOutput.destinationInfo().selected?'音频已再次保存至所选目录。':'音频已再次交给浏览器保存。'; return;
+        }catch(error){if(error.name!=='NotFoundError')throw error;delete source.audio[format];}
+      }
       // Open the output from the user's click before any asynchronous file reads.
       sink = await FileOutput.createHlsOutput(filename, format, job.signal, link => {
-        if (link) { handoffUrl = link; panel.audiosave.hidden = false; panel.audiosave.href = link; panel.audiosave.download = filename; }
+        if (link) { handoffUrl = link; panel.audiosave.href = link; panel.audiosave.download = filename; }
         else if (panel.audiosave.href === handoffUrl) panel.audiosave.hidden = true;
-      });
+      }, {browserDownload: automatic, retentionMs: Number(panel.retention.value)});
       stopSink = () => { void sink.abort().catch(error => console.warn('[PKU-Replay-Saver] 音频文件回收待重试', error)); };
       job.signal.addEventListener('abort', stopSink, {once: true}); job.signal.throwIfAborted();
       estimateTimer = setInterval(updateMetrics, 1000);
       const convert = file => AudioExport.convert({file, format, sink, muxjs, mp4Writer,
         reader: AudioReader, encoderFactory: mp3EncoderFactory, signal: job.signal, onDiagnostic: recordDiagnostic,
         onProgress({progress, packets}) {
-          panel.progress.value = progress; panel.percent.textContent = `${(progress * 100).toFixed(1)}%`;
+          panel.progress.value = automatic ? .85 + progress * .15 : progress; panel.percent.textContent = `${(panel.progress.value * 100).toFixed(1)}%`;
           panel.status.textContent = format === 'aac' ? '正在提取 AAC 音频，无需重新编码…' : '正在转换为 MP3…';
           processedPackets = packets; estimator.note(progress); updateMetrics();
         },
@@ -2710,8 +2978,9 @@ return module.exports; })();
       else await source.sink.withFile(convert);
       job.signal.throwIfAborted(); panel.status.textContent = '正在保存音频…';
       await sink.close(); committed = true;
+      (source.audio ||= {})[format] = {sink, filename}; updateSavedButtons(panel);
       panel.status.dataset.state = 'success';
-      panel.status.textContent = sink.type === 'file-picker' ? `${format === 'aac' ? 'AAC' : 'MP3'} 音频已保存。` : '音频已交给浏览器保存；临时副本将在 5 分钟后清理。';
+      panel.status.textContent = sink.type !== 'browser-download' ? `${format === 'aac' ? 'AAC' : 'MP3'} 音频已保存。` : `音频已交给浏览器保存；${cacheText(panel)}。`;
     } catch (caughtError) {
       let error = job.signal.aborted ? job.signal.reason || caughtError : caughtError;
       if (caughtError.cleanupFailed && error !== caughtError) error = FileOutput.withCleanupFailure(error, caughtError.cleanupError, caughtError.cleanupRecovery);
@@ -2725,9 +2994,9 @@ return module.exports; })();
       panel.status.textContent = `${error.name === 'AbortError' ? '音频转换已取消。' : caughtError.name === 'NotFoundError' ? '原视频已移除，请再次点击“保存音频”选择已保存的视频。' : '音频保存失败：' + errorMessage(error)} ${cleanup}`;
     } finally {
       clearInterval(estimateTimer);
-      job.signal.removeEventListener('abort', stopSink); activeJob = null;
-      panel.audioformat.disabled = false; panel.cancel.hidden = true;
-      for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = false;
+      job.signal.removeEventListener('abort', stopSink); activeJob = automatic ? job : null;
+      panel.content.disabled = panel.retention.disabled = automatic; updateFormatControls(panel); panel.cancel.hidden = true;
+      for (const item of panels) item.start.disabled = item.sample.disabled = item.audio.disabled = item.video.disabled = automatic;
     }
   }
 
