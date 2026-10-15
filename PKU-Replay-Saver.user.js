@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Replay-Saver
 // @namespace    pku-replay-saver
-// @version      1.8.2
+// @version      1.8.3
 // @description  使用当前登录态下载北大录播，支持普通 MP4、fMP4 和 TS，可另存 MP3 / AAC 音频，显示进度与剩余时间。
 // @match        https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/*
 // @match        https://onlineroomse.pku.edu.cn/player*
@@ -1932,7 +1932,7 @@ const require = name => { if (name === './progress-estimate.js') return Progress
     let active, auxiliaryActive, bottom, table, layoutObserver, observedContainer, choices, leaving = false;
     const notifyJobs = () => onJob(active?.controller || auxiliaryActive?.controller || null, active?.retry);
     const available = entry => Boolean(entry.localFile || (!entry.needsFile && entry.video?.sink.fileAvailable));
-    const settings = () => ({content: choices?.querySelector('.content').value || 'video', audioFormat: choices?.querySelector('.audioformat').value || 'aac', videoFormat: choices?.querySelector('.format').value || 'mp4'});
+    const settings = () => ({content: choices?.querySelector('.replay-download-content').value || 'video', audioFormat: choices?.querySelector('.audioformat').value || 'aac', videoFormat: choices?.querySelector('.format').value || 'mp4'});
     const satisfied = (entry, options) => (options.content === 'audio' || entry.video?.saved) && (options.content === 'video' || entry.audio?.[options.audioFormat]);
     const reserved = entry => (active?.list.includes(entry) && !active.skipped.has(entry) && !active.finished.has(entry)) || pending.some(task => task.list.includes(entry)) || auxiliaryActive?.list.includes(entry) || auxiliary.some(task=>task.list.includes(entry));
     const downloadable = (control, options = settings()) => selectedEntries(control).filter(entry => !satisfied(entry, options) && !reserved(entry));
@@ -2134,9 +2134,9 @@ const require = name => { if (name === './progress-estimate.js') return Progress
         bar.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:8px;border-top:1px solid #e4eaf4;padding:12px 10px;margin-top:10px;';
         choices = document.createElement('span'); choices.setAttribute('data-replay-list-options', '');
         choices.style.cssText = 'display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px;margin-right:auto;';
-        choices.innerHTML = '<span>下载设置：</span><select class="content" aria-label="下载内容"><option value="video">仅视频（有声音）</option><option value="audio">仅音频</option><option value="both">视频和音频</option></select><select class="format" aria-label="视频格式" title="HLS 输出格式；直接提供 MP4 的录播请选择 MP4"><option value="mp4">MP4（推荐）</option><option value="fmp4">fMP4（分片 MP4）</option><option value="ts">TS（原始分片）</option></select><select class="audioformat" aria-label="音频格式" title="AAC 无需重新编码；MP3 兼容性更好"><option value="aac">AAC (.m4a)</option><option value="mp3">MP3 (.mp3)</option></select><button class="directory" type="button" hidden>选择保存目录</button><span class="directory-name"></span>';
-        for (const select of choices.querySelectorAll('select')) { select.style.cssText = 'font:13px system-ui;padding:6px 8px;min-width:132px;height:34px;border:1px solid #d6dde8;border-radius:6px;background:white;color:#32445f;'; select.onchange = () => { renderAll(); reserveLayout(); }; }
-        choices.querySelector('.content').style.minWidth='180px';
+        choices.innerHTML = '<span>下载设置：</span><select class="replay-download-content" aria-label="下载内容"><option value="video">仅视频（有声音）</option><option value="audio">仅音频</option><option value="both">视频和音频</option></select><select class="format" aria-label="视频格式" title="HLS 输出格式；直接提供 MP4 的录播请选择 MP4"><option value="mp4">MP4（推荐）</option><option value="fmp4">fMP4（分片 MP4）</option><option value="ts">TS（原始分片）</option></select><select class="audioformat" aria-label="音频格式" title="AAC 无需重新编码；MP3 兼容性更好"><option value="aac">AAC (.m4a)</option><option value="mp3">MP3 (.mp3)</option></select><button class="directory" type="button" hidden>选择保存目录</button><span class="directory-name"></span>';
+        for (const select of choices.querySelectorAll('select')) { select.style.cssText = 'font:13px system-ui;padding:6px 8px;min-width:132px;box-sizing:border-box;height:34px!important;min-height:34px!important;max-height:34px!important;line-height:20px;align-self:center;border:1px solid #d6dde8;border-radius:6px;background:white;color:#32445f;'; select.setAttribute('size', '1'); select.onchange = () => { renderAll(); reserveLayout(); }; }
+        choices.querySelector('.replay-download-content').style.minWidth='180px';
         const folderButton=choices.querySelector('.directory');folderButton.style.cssText='font:12px system-ui;padding:5px 8px;background:none;border:1px solid #d6dde8;border-radius:6px;color:#32445f;';
         folderButton.onclick=async()=>{try{await FileOutput.prepareDestination(true);}catch(error){if(error.name!=='AbortError')message(bottom,errorMessage(error),true);}};
         const folderName=choices.querySelector('.directory-name');folderName.style.cssText='max-width:96px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;';
@@ -2626,7 +2626,7 @@ return module.exports; })();
     p { line-height: 1.5; margin: 8px 0 0; }
     label { display: block; margin: 12px 0; } input, select { width: 100%; margin-top: 5px; padding: 8px; border: 1px solid #b4bdc8; border-radius: 6px; color: #18212d; background: #fff; }
     .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-    .toolbar select { width: auto; margin: 0; }
+    .toolbar select { width: auto; margin: 0; height: 40px; min-height: 40px; max-height: 40px; align-self: center; }
     .progress-label { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12px; }
     progress { display: block; width: 100%; height: 12px; accent-color: #1268cf; }
     .secondary { background: #e7edf4; color: #18212d; } .status { overflow-wrap: anywhere; font-size: 13px; }
@@ -2939,7 +2939,7 @@ return module.exports; })();
     const recordDiagnostic = value => {
       diagnostics.push(value);
       if (diagnostics.length > 100) diagnostics.splice(30, diagnostics.length - 100);
-      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.8.2-debug', events: diagnostics}, null, 2);
+      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.8.3-debug', events: diagnostics}, null, 2);
     };
     recordDiagnostic({stage: 'browser', userAgent: navigator.userAgent, selectedFormat: format,
       sandboxAudioDecoder: typeof globalThis.AudioDecoder, pageAudioDecoder: typeof page.AudioDecoder,
