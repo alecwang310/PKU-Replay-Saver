@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Replay-Saver
 // @namespace    pku-replay-saver
-// @version      1.8.3
+// @version      2.0.0
 // @description  使用当前登录态下载北大录播，支持普通 MP4、fMP4 和 TS，可另存 MP3 / AAC 音频，显示进度与剩余时间。
 // @match        https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/*
 // @match        https://onlineroomse.pku.edu.cn/player*
@@ -1250,13 +1250,6 @@ const AudioExport = (() => { const module = { exports: {} }; const exports = mod
 })(globalThis, function () {
   'use strict';
   const BATCH = 64;
-  function errorDetails(error) {
-    const result = [];
-    for (let depth = 0; error && depth < 4; depth++, error = error.cause) {
-      result.push({name: error.name || 'Error', message: String(error.message || error).replace(/https?:\/\/[^\s"']+/g, '[地址省略]'), code: error.code});
-    }
-    return result;
-  }
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   function fragment(frames, config, muxjs, decodeTime = 0) {
     const track = {id: 1, type: 'audio', channelcount: config.channels, samplerate: config.sampleRate,
@@ -1341,22 +1334,15 @@ self.onmessage = event => {
     }
     return {encode: pcm => run({pcm}), finish: () => run({finish: true}), dispose() { signal?.removeEventListener('abort', stop); stop(); main = null; }};
   }
-  async function createDecoder({config, muxjs, mp4Writer, signal, environment = globalThis, diagnostic = () => {}}) {
+  async function createDecoder({config, muxjs, mp4Writer, signal, environment = globalThis}) {
     const codec = {codec: config.codec, sampleRate: config.sampleRate, numberOfChannels: config.channels, description: new Uint8Array(config.description)};
-    let decoder, failure, context, output = [], loggedOutput = false;
-    diagnostic('decoder-capabilities', {AudioDecoder: Boolean(environment.AudioDecoder), EncodedAudioChunk: Boolean(environment.EncodedAudioChunk), AudioContext: Boolean(environment.AudioContext || environment.webkitAudioContext)});
-    try {
-      const probe = new Float32Array(1), mapped = Array.from({length: 1}, () => probe);
-      diagnostic('array-helper-check', {fromPreservesChannel: mapped[0] === probe});
-    } catch (error) { diagnostic('array-helper-check', {error: errorDetails(error)}); }
+    let decoder, failure, context, output = [];
     if (environment.AudioDecoder && environment.EncodedAudioChunk) {
       try {
         const support = await environment.AudioDecoder.isConfigSupported(codec);
-        diagnostic('webcodecs-support', {supported: support.supported});
         if (support.supported) {
-          decoder = new environment.AudioDecoder({error(error) { diagnostic('webcodecs-error-callback', {error: errorDetails(error)}); failure = error; }, output(data) {
+          decoder = new environment.AudioDecoder({error(error) { failure = error; }, output(data) {
             try {
-              if (!loggedOutput) { loggedOutput = true; diagnostic('webcodecs-audio-data', {format: data.format, frames: data.numberOfFrames, channels: data.numberOfChannels, sampleRate: data.sampleRate}); }
               // Ask for planar f32 explicitly: Safari hands back interleaved f32
               // AudioData but converts per plane when asked (its copyTo rejects
               // interleaved destinations outright).
@@ -1369,19 +1355,17 @@ self.onmessage = event => {
                 const values = new Float32Array(frames); data.copyTo(values, {planeIndex, format: 'f32-planar'}); planes.push(values);
               }
               output.push({planes, rate});
-            } catch (error) { if (!failure) diagnostic('webcodecs-copy-failed', {format: data.format, requestedFormat: 'f32-planar', error: errorDetails(error)}); failure = error; } finally { data.close(); }
+            } catch (error) { failure = error; } finally { data.close(); }
           }});
-          decoder.configure(codec); diagnostic('webcodecs-configured', {state: decoder.state});
+          decoder.configure(codec);
         }
-      } catch (error) { diagnostic('webcodecs-setup-failed', {error: errorDetails(error)}); if (decoder?.state !== 'closed') decoder?.close(); decoder = null; }
+      } catch (error) { if (decoder?.state !== 'closed') decoder?.close(); decoder = null; }
     }
     const ensureContext = () => {
       if (context) return;
       const AudioContext = environment.AudioContext || environment.webkitAudioContext;
       if (!AudioContext) throw new Error('当前浏览器无法解码 AAC 音频，请选择 AAC 保存。');
-      try { context = new AudioContext({sampleRate: config.sampleRate}); }
-      catch (error) { diagnostic('web-audio-constructor-failed', {requestedSampleRate: config.sampleRate, error: errorDetails(error)}); throw error; }
-      diagnostic('web-audio-created', {sampleRate: context.sampleRate, state: context.state});
+      context = new AudioContext({sampleRate: config.sampleRate});
     };
     if (!decoder) ensureContext();
     let timestamp = 0, preroll = [];
@@ -1393,10 +1377,8 @@ self.onmessage = event => {
         const prefix = preroll.length;
         const bytes = await batchMp4([...preroll, ...frames], config, muxjs, mp4Writer);
         let audio;
-        diagnostic('web-audio-decode-batch', {packets: frames.length, prerollPackets: prefix, bufferBytes: bytes.byteLength, bufferType: Object.prototype.toString.call(bytes), constructor: bytes.constructor?.name, sampleRate: context.sampleRate, state: context.state});
-        try { audio = await context.decodeAudioData(bytes); } catch (error) { diagnostic('web-audio-decode-failed', {error: errorDetails(error)}); if (signal?.aborted) throw signal.reason; throw new Error('浏览器未能解码 AAC 音频，请选择 AAC 保存。', {cause: error}); }
+        try { audio = await context.decodeAudioData(bytes); } catch (error) { if (signal?.aborted) throw signal.reason; throw new Error('浏览器未能解码 AAC 音频，请选择 AAC 保存。', {cause: error}); }
         signal?.throwIfAborted();
-        diagnostic('web-audio-decoded', {frames: audio.length, channels: audio.numberOfChannels, sampleRate: audio.sampleRate});
         const skipped = Math.round(prefix * 1024 * audio.sampleRate / config.sampleRate);
         const expected = Math.round(frames.length * 1024 * audio.sampleRate / config.sampleRate);
         const planes = [];
@@ -1414,8 +1396,7 @@ self.onmessage = event => {
           const data = new Uint8Array(frame.data);
           decoder.decode(new environment.EncodedAudioChunk({type: 'key', timestamp: Math.round(timestamp), duration: Math.round(1024 / config.sampleRate * 1e6), data})); timestamp += 1024 / config.sampleRate * 1e6;
         }
-        diagnostic('webcodecs-decode-batch', {packets: frames.length, firstPacketBytes: frames[0]?.data.length, firstFrameHex: [...frames[0]?.data.slice(0, 8) || []].map(value => value.toString(16).padStart(2, '0')).join(''), chunkDurationUs: Math.round(1024 / config.sampleRate * 1e6), state: decoder.state});
-        try { await decoder.flush(); } catch (error) { diagnostic('webcodecs-flush-failed', {error: errorDetails(error), callbackError: errorDetails(failure)}); throw error ?? failure ?? new Error('flush failed'); }
+        await decoder.flush();
         if (failure) throw failure;
         const result = output; output = []; return result;
     }
@@ -1428,7 +1409,6 @@ self.onmessage = event => {
             if (signal?.aborted) throw signal.reason;
             // Safari's WebCodecs AAC decoder rejects some valid streams that its
             // container decoder accepts; retry this batch and the rest there.
-            diagnostic('webcodecs-fallback', {packets: frames.length, error: errorDetails(error)});
             try { if (decoder.state !== 'closed') decoder.close(); } catch {}
             decoder = null; failure = null; output = [];
             ensureContext();
@@ -1439,11 +1419,9 @@ self.onmessage = event => {
       dispose() { signal?.removeEventListener('abort', cancel); cancel(); output.length = 0; preroll.length = 0; },
     };
   }
-  async function convert({file, format = 'mp3', sink, muxjs, mp4Writer, reader, encoderFactory, signal, onProgress = () => {}, onDiagnostic = () => {}, environment = globalThis}) {
+  async function convert({file, format = 'mp3', sink, muxjs, mp4Writer, reader, encoderFactory, signal, onProgress = () => {}, environment = globalThis}) {
     if (!['mp3', 'aac'].includes(format)) throw new Error('请选择 MP3 或 AAC 音频格式。');
-    const diagnostic = (stage, details = {}) => { try { onDiagnostic({stage, ...details}); } catch { /* Debug output must not affect conversion. */ } };
-    diagnostic('conversion-start', {format, fileSize: file.size, fileType: file.type});
-    let config, decoder, encoder, aacWriter, count = 0, pending = [], loggedPcm = false;
+    let config, decoder, encoder, aacWriter, count = 0, pending = [];
     async function process() {
       if (!pending.length) return;
       signal?.throwIfAborted();
@@ -1452,12 +1430,6 @@ self.onmessage = event => {
         await aacWriter.writeFragment(media.init, media.data);
       } else {
         const pcm = await decoder.decode(pending);
-        if (!loggedPcm) {
-          loggedPcm = true;
-          const channelTypes = [], channelFrames = [];
-          for (const plane of pcm[0]?.planes || []) { channelTypes.push(Object.prototype.toString.call(plane)); channelFrames.push(plane?.length ?? null); }
-          diagnostic('mp3-pcm-batch', {frames: pcm.length, channels: pcm[0]?.planes.length, channelTypes, channelFrames});
-        }
         // Validate every channel before transferring any buffer: a malformed
         // batch must never become silent, incomplete, or partly detached PCM.
         if (!pcm.length) throw new Error('解码器没有返回音频采样。');
@@ -1478,10 +1450,9 @@ self.onmessage = event => {
       for await (const packet of reader.packets(file, muxjs, signal)) {
         if (!config) {
           config = packet.config;
-          diagnostic('aac-config', {codec: config.codec, sampleRate: config.sampleRate, channels: config.channels, audioObjectType: config.audioobjecttype, samplingFrequencyIndex: config.samplingfrequencyindex, descriptionHex: [...config.description].map(value => value.toString(16).padStart(2, '0')).join('')});
           if (format === 'aac') aacWriter = mp4Writer.createStandardMP4Writer(sink);
           else {
-            decoder = await createDecoder({config, muxjs, mp4Writer, signal, environment, diagnostic});
+            decoder = await createDecoder({config, muxjs, mp4Writer, signal, environment});
             encoder = createEncoder({factory: encoderFactory, sink, signal, WorkerClass: environment.Worker, URLAPI: environment.URL || URL});
           }
         } else if (config.sampleRate !== packet.config.sampleRate || config.channels !== packet.config.channels || config.description.some((value, index) => value !== packet.config.description[index])) throw new Error('录播音频编码参数发生变化。');
@@ -1490,10 +1461,9 @@ self.onmessage = event => {
       await process(); if (!count) throw new Error('录播没有可提取的音频。');
       if (aacWriter) await aacWriter.finish(); else await encoder.finish();
       signal?.throwIfAborted(); onProgress({progress: 1, packets: count}); return {packets: count};
-    } catch (error) { diagnostic('conversion-failed', {processedPackets: count, error: errorDetails(error)}); throw error; }
-    finally { decoder?.dispose(); encoder?.dispose(); aacWriter?.dispose(); pending.length = 0; }
+    } finally { decoder?.dispose(); encoder?.dispose(); aacWriter?.dispose(); pending.length = 0; }
   }
-  return {convert, fragment, createEncoder, workerSource, errorDetails};
+  return {convert, fragment, createEncoder, workerSource};
 });
 
 return module.exports; })();
@@ -1652,8 +1622,8 @@ const Core = (() => { const module = { exports: {} }; const exports = module.exp
     return bytes;
   }
 
-  function createMP4Writer(muxjs, sink, duration, standardWriter) {
-    const transmuxer = new muxjs.mp4.Transmuxer({ remux: true, keepOriginalTimestamps: false });
+  function createMP4Writer(muxjs, sink, duration, standardWriter, remote, signal) {
+    const transmuxer = remote || new muxjs.mp4.Transmuxer({ remux: true, keepOriginalTimestamps: false });
     const chunks = [];
     let fragments = 0;
     transmuxer.on('data', event => chunks.push(event));
@@ -1669,17 +1639,26 @@ const Core = (() => { const module = { exports: {} }; const exports = module.exp
       }
     }
     return {
-      async write(bytes) { transmuxer.push(bytes); transmuxer.flush(); await drain(); },
+      async write(bytes) {
+        if (remote) await transmuxer.push(bytes);
+        else {
+          // Restore 1.8.3's one push per segment; no packet task scheduler.
+          signal?.throwIfAborted();
+          transmuxer.push(bytes);
+          signal?.throwIfAborted();
+        }
+        await transmuxer.flush(); await drain();
+      },
       async finish() {
-        transmuxer.endTimeline(); await drain();
+        await transmuxer.endTimeline(); await drain();
         if (!fragments) throw new Error('未找到 H.264 / AAC 媒体数据。');
-        await standardWriter?.finish();
+        if(standardWriter)await standardWriter.finish();
       },
       dispose() { try { transmuxer.dispose(); } finally { chunks.length = 0; } },
     };
   }
 
-  async function download({ url, request, sink, muxjs, mp4Writer, format = 'mp4', maxDuration, signal, onProgress = () => {}, cryptoAPI = globalThis.crypto }) {
+  async function download({ url, request, sink, muxjs, mp4Writer, transmuxerFactory, format = 'mp4', maxDuration, signal, onProgress = () => {}, cryptoAPI = globalThis.crypto }) {
     if (!['mp4', 'fmp4', 'ts'].includes(format)) throw new Error('请选择 MP4、fMP4 或 TS 格式。');
     const playlist = limitPlaylist(await resolvePlaylist(url, request, signal), maxDuration);
     const keys = new Map();
@@ -1696,7 +1675,7 @@ const Core = (() => { const module = { exports: {} }; const exports = module.exp
     if (playlist.segments.some(segment => segment.discontinuity)) throw new Error('视频时间线不连续，暂不支持此录播。');
     if (fragmented && format === 'ts') throw new Error('源视频为 fMP4 分片，请选择 MP4 或 fMP4 输出。');
     const standardWriter = format === 'mp4' ? mp4Writer.createStandardMP4Writer(sink) : null;
-    const writer = format !== 'ts' && !fragmented ? createMP4Writer(muxjs, sink, playlist.duration, standardWriter) : null;
+    let writer;
     let inputBytes = 0, currentMap = null;
     const pending = new Map(), controller = new AbortController();
     const abort = () => controller.abort(signal?.reason);
@@ -1710,6 +1689,11 @@ const Core = (() => { const module = { exports: {} }; const exports = module.exp
         .then(response => ({ response }), error => ({ error })));
     }
     try {
+      if (format !== 'ts' && !fragmented) {
+        const remote = await transmuxerFactory?.(controller.signal);
+        controller.signal.throwIfAborted();
+        writer = createMP4Writer(muxjs, sink, playlist.duration, standardWriter, remote, controller.signal);
+      }
       for (let index = 0; index < Math.min(3, playlist.segments.length); index++) schedule(index);
       for (let index = 0; index < playlist.segments.length; index++) {
         if (controller.signal.aborted) throw new DOMException('下载已取消', 'AbortError');
@@ -2302,7 +2286,7 @@ const require = name => { if (name === './progress-estimate.js') return Progress
           const abortRow = () => job.currentController.abort(job.controller.signal.reason);
           job.controller.signal.addEventListener('abort', abortRow, {once:true});
           message(entry.control, ''); renderAll();
-          let stage = 0, baseBytes = 0, stageBytes = 0;
+          let stage = 0, baseBytes = 0, stageBytes = 0, lastPaint = -Infinity;
           const wantsAudio = mode === 'video' ? options.content !== 'video' : !['resave'].includes(mode);
           const cachedAudio = !['video','resave'].includes(mode) && entry.audio?.[mode]?.sink.fileAvailable;
           const needsSource = !cachedAudio && (!entry.video || (!available(entry) && !entry.video.saved));
@@ -2314,6 +2298,10 @@ const require = name => { if (name === './progress-estimate.js') return Progress
               job.currentEstimate.note(mapped, job.entryBytes);
               job.batchEstimate.note((index + mapped)/list.length, job.completedBytes + job.entryBytes);
             }
+            // Sample every update; limit painting to 10 Hz, with completion immediate.
+            const now = performance.now();
+            if (value !== null && value !== 1 && now - lastPaint < 100) return;
+            if (value !== null) lastPaint = now;
             progress(entry.control, mapped, text);
             if (control.batch) progress(control, mapped === null ? index/list.length : (index+mapped)/list.length, `${index+1}/${list.length} · ${text}`);
             updateEstimates();
@@ -2547,21 +2535,26 @@ return module.exports; })();
       handle = GM_xmlhttpRequest({
         method: 'GET', url, headers, responseType: type, anonymous, timeout: 45000,
         onload(response) {
-          if (response.status !== (range ? 206 : 200)) return finish(reject, httpError(response.status));
-        const total = /content-range:\s*bytes\s+\d+-\d+\/(\d+)/i.exec(response.responseHeaders || '')?.[1];
-        finish(resolve, { data: type === 'text' ? response.responseText : response.response, url: response.finalUrl || url, rangeTotal: total ? Number(total) : undefined });
+          if(settled)return;
+          try {
+            if (response.status !== (range ? 206 : 200)) return finish(reject, httpError(response.status));
+            const total = /content-range:\s*bytes\s+\d+-\d+\/(\d+)/i.exec(response.responseHeaders || '')?.[1];
+            // Keep the existing binary transport and read the SDK getter once.
+            const data = type === 'text' ? response.responseText : response.response;
+            finish(resolve, {data, url: response.finalUrl || url, rangeTotal: total ? Number(total) : undefined});
+          }catch(error){finish(reject,error);}
         },
-        onreadystatechange(response) {
+        onreadystatechange: range?function(response) {
           // Stop a server that ignores Range before buffering an entire MP4.
           if (range && response.readyState === 2 && response.status && response.status !== 206) {
             finish(reject, httpError(response.status)); try { handle?.abort(); } catch {}
           }
-        },
-        onprogress(response) {
+        }:undefined,
+        onprogress: range?function(response) {
           if (range && response.loaded > range.end - range.start + 1) {
             finish(reject, new Error('服务器返回的字节范围过大。')); try { handle?.abort(); } catch {}
           }
-        },
+        }:undefined,
         onerror() { finish(reject, new Error('网络请求失败，请检查校园网 / VPN 和脚本的跨域访问权限。')); },
         ontimeout() { finish(reject, new Error('视频服务器响应超时。')); },
         onabort() { finish(reject, new DOMException('下载已取消', 'AbortError')); },
@@ -2702,10 +2695,6 @@ return module.exports; })();
         <button class="audio">保存音频</button>
       </div>
       <p class="audio-note notice" hidden>MP3 兼容性更好，需要重新编码；AAC 保存为 .m4a，保留原始音频编码。</p>
-      <details class="audio-debug" hidden><summary>音频调试信息（临时）</summary>
-        <button class="audio-debug-copy secondary" style="margin:8px 0">复制调试信息</button>
-        <textarea class="audio-debug-text" readonly rows="12" aria-label="音频调试信息" style="width:100%;box-sizing:border-box;font:12px monospace;white-space:pre;resize:vertical"></textarea>
-      </details>
       <input class="audio-input" type="file" accept=".mp4,.m4a,.ts,video/*,audio/mp4" hidden>
       <a class="audiosave save" hidden>再次保存已完成的音频</a>
       <a class="videosave save" hidden>再次保存已完成的视频</a>
@@ -2728,12 +2717,6 @@ return module.exports; })();
     panel.audioTools = shadow.querySelector('.audio-tools');
     panel.audioNote = shadow.querySelector('.audio-note');
     panel.audioInput = shadow.querySelector('.audio-input');
-    panel.audioDebug = shadow.querySelector('.audio-debug');
-    panel.audioDebugText = shadow.querySelector('.audio-debug-text');
-    shadow.querySelector('.audio-debug-copy').onclick = async () => {
-      try { await navigator.clipboard.writeText(panel.audioDebugText.value); shadow.querySelector('.audio-debug-copy').textContent = '已复制'; }
-      catch { panel.audioDebugText.focus(); panel.audioDebugText.select(); shadow.querySelector('.audio-debug-copy').textContent = '请手动复制下方信息'; }
-    };
     panel.sources.onchange = () => { if (panel.sources.value) panel.url.value = panel.sources.value; };
     panel.start.onclick = () => startDownload(panel);
     panel.sample.onclick = () => startDownload(panel, 300);
@@ -2848,7 +2831,7 @@ return module.exports; })();
     panel.metrics.textContent = '0 MB · 速度 — · 剩余时间 —';
     panel.status.textContent = '请选择保存位置…';
     const estimator = ProgressEstimate.createEstimate();
-    let downloaded = 0;
+    let downloaded = 0, lastPaint = -Infinity;
     const updateMetrics = () => {
       const {speed, remaining} = estimator.read();
       panel.metrics.textContent = `${(downloaded / 1048576).toFixed(1)} MB · ${speed === null ? '—' : (speed / 1048576).toFixed(2)} MB/s · 剩余约 ${formatTime(remaining)}`;
@@ -2868,9 +2851,13 @@ return module.exports; })();
       estimateTimer = setInterval(updateMetrics, 1000);
       await Core.download({ url, request, sink, muxjs, mp4Writer, format, maxDuration, signal: job.signal,
         onProgress({ done, total, bytes }) {
+          downloaded = bytes; estimator.note(done / total, bytes);
+          const now = performance.now();
+          if (done !== total && now - lastPaint < 100) return;
+          lastPaint = now;
           panel.progress.max = 1; panel.progress.value = done / total * (wantsAudio ? .85 : 1);
           panel.percent.textContent = `${(100 * panel.progress.value).toFixed(1)}%`;
-          downloaded = bytes; estimator.note(done / total, bytes); updateMetrics();
+          updateMetrics();
           panel.status.textContent = `正在下载视频分片 ${done}/${total}…`;
         },
       });
@@ -2934,20 +2921,8 @@ return module.exports; })();
     panel.audiosave.hidden = true; panel.progress.max = 1; panel.progress.value = automatic ? .85 : 0; panel.percent.textContent = automatic ? '85%' : '0%';
     panel.metrics.textContent = '已处理 0 个音频包 · 剩余约 —';
     panel.status.textContent = '请选择音频保存位置…';
-    const diagnostics = [];
-    panel.audioDebug.hidden = false; panel.audioDebug.open = false;
-    const recordDiagnostic = value => {
-      diagnostics.push(value);
-      if (diagnostics.length > 100) diagnostics.splice(30, diagnostics.length - 100);
-      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.8.3-debug', events: diagnostics}, null, 2);
-    };
-    recordDiagnostic({stage: 'browser', userAgent: navigator.userAgent, selectedFormat: format,
-      sandboxAudioDecoder: typeof globalThis.AudioDecoder, pageAudioDecoder: typeof page.AudioDecoder,
-      sandboxAudioContext: typeof globalThis.AudioContext, pageAudioContext: typeof page.AudioContext,
-      sameDecoder: globalThis.AudioDecoder === page.AudioDecoder, sameAudioContext: globalThis.AudioContext === page.AudioContext,
-      Worker: typeof globalThis.Worker, source: panel.localAudioFile ? 'selected-file' : source.sink.type});
     const estimator = ProgressEstimate.createEstimate();
-    let processedPackets = 0;
+    let processedPackets = 0, lastPaint = -Infinity;
     const updateMetrics = () => { panel.metrics.textContent = `已处理 ${processedPackets} 个音频包 · 剩余约 ${formatTime(estimator.read().remaining)}`; };
     try {
       await FileOutput.prepareDestination();job.signal.throwIfAborted();
@@ -2967,11 +2942,15 @@ return module.exports; })();
       job.signal.addEventListener('abort', stopSink, {once: true}); job.signal.throwIfAborted();
       estimateTimer = setInterval(updateMetrics, 1000);
       const convert = file => AudioExport.convert({file, format, sink, muxjs, mp4Writer,
-        reader: AudioReader, encoderFactory: mp3EncoderFactory, signal: job.signal, onDiagnostic: recordDiagnostic,
+        reader: AudioReader, encoderFactory: mp3EncoderFactory, signal: job.signal,
         onProgress({progress, packets}) {
+          processedPackets = packets; estimator.note(progress);
+          const now = performance.now();
+          if (progress !== 1 && now - lastPaint < 100) return;
+          lastPaint = now;
           panel.progress.value = automatic ? .85 + progress * .15 : progress; panel.percent.textContent = `${(panel.progress.value * 100).toFixed(1)}%`;
           panel.status.textContent = format === 'aac' ? '正在提取 AAC 音频，无需重新编码…' : '正在转换为 MP3…';
-          processedPackets = packets; estimator.note(progress); updateMetrics();
+          updateMetrics();
         },
       });
       if (panel.localAudioFile) await convert(panel.localAudioFile);
@@ -2984,7 +2963,6 @@ return module.exports; })();
     } catch (caughtError) {
       let error = job.signal.aborted ? job.signal.reason || caughtError : caughtError;
       if (caughtError.cleanupFailed && error !== caughtError) error = FileOutput.withCleanupFailure(error, caughtError.cleanupError, caughtError.cleanupRecovery);
-      panel.audioDebug.open = true; recordDiagnostic({stage: 'ui-failure', error: AudioExport.errorDetails(caughtError)});
       if (caughtError.name === 'NotFoundError') source.needsFile = true;
       if (sink && !committed) {
         try { await sink.abort(); } catch (cleanupError) { error = FileOutput.withCleanupFailure(error, cleanupError, sink.type === 'browser-download'); }
@@ -3060,7 +3038,15 @@ return module.exports; })();
   }
 
   let scheduled = false;
-  const observer = new MutationObserver(() => {
+  const ownUISelector = '[data-replay-hls-panel],[data-replay-list-bar],[data-replay-list-cell],[data-replay-list-heading],[data-replay-list-control],[data-replay-source-frame]';
+  const ownUI = node => node?.nodeType === 1 && Boolean(node.closest(ownUISelector));
+  const observer = new MutationObserver(records => {
+    // Controls update their own labels and progress constantly. Observing those
+    // writes caused refresh -> label write -> refresh and a full table layout
+    // every 100 ms, even when no download or page navigation was happening.
+    const changed = records.some(record => !ownUI(record.target) &&
+      (record.type === 'attributes' || [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1 && !ownUI(node))));
+    if (!changed) return;
     if (!scheduled) { scheduled = true; setTimeout(() => { scheduled = false; injectPanels(); }, 100); }
   });
   observer.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
