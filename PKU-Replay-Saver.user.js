@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PKU-Replay-Saver
 // @namespace    pku-replay-saver
-// @version      1.6.3
+// @version      1.6.4
 // @description  使用当前登录态下载北大录播，支持普通 MP4、fMP4 和 TS，可另存 MP3 / AAC 音频，显示进度与剩余时间。
 // @match        https://course.pku.edu.cn/webapps/bb-streammedia-hqy-BBLEARN/*
 // @match        https://onlineroomse.pku.edu.cn/player*
@@ -1831,9 +1831,11 @@ const require = name => { if (name === './progress-estimate.js') return Progress
   `;
   function create({document, location, Core, FileOutput, AudioExport, AudioReader, muxjs, mp4Writer, encoderFactory,
     resolveSource, request, errorMessage, onJob = () => {}}) {
-    const entries = new Map(), controls = new Set();
-    let active, bottom, table, layoutObserver, observedContainer;
+    const entries = new Map(), controls = new Set(), pending = [];
+    let active, bottom, table, layoutObserver, observedContainer, leaving = false;
     const available = entry => Boolean(entry.localFile || (!entry.needsFile && entry.video?.sink.fileAvailable));
+    const reserved = entry => active?.list.includes(entry) || pending.some(task => task.list.includes(entry));
+    const downloadable = control => selectedEntries(control).filter(entry => !entry.video && !reserved(entry));
     function message(control, text, error = false) {
       control.message.textContent = text; control.warning.hidden = !error; control.warning.title = text;
       control.progressText = text;
@@ -1855,18 +1857,40 @@ const require = name => { if (name === './progress-estimate.js') return Progress
     }
     function render(control) {
       const busy = active && (active.control === control || active.current?.control === control || (control.batch && !active.control.host.isConnected));
+      const queued = pending.some(task => task.control === control);
+      const occupied = busy || queued;
       const done = control.batch ? control.complete : Boolean(control.entry.video);
-      control.main.hidden = Boolean(busy); control.ring.hidden = !busy; control.cancel.hidden = !busy;
-      control.audio.hidden = !done || Boolean(busy);
+      control.main.hidden = Boolean(occupied); control.ring.hidden = !occupied; control.cancel.hidden = !occupied;
+      control.audio.hidden = !done || Boolean(occupied);
       control.metrics.style.visibility = busy ? 'visible' : 'hidden';
       control.main.textContent = done ? (control.batch ? '重存全部' : '重存') : (control.batch ? '下载全部' : '下载');
       control.main.title = done ? '重新保存已完成的视频' : '保存完整 MP4';
-      control.main.disabled = Boolean(active); control.summary.setAttribute('aria-disabled', String(Boolean(active)));
+      control.main.disabled = leaving || Boolean(occupied) || Boolean(active && (done || !downloadable(control).length));
+      control.summary.setAttribute('aria-disabled', String(Boolean(active)));
       for (const button of control.audio.querySelectorAll('button')) button.disabled = Boolean(active);
       control.cancel.disabled = Boolean(busy && active.cancelling);
       control.cancel.textContent = busy && active.cancelling ? '取消中' : '取消';
+      if (queued && !busy) { progress(control, null, '排队中'); control.percent.textContent = '排队'; }
     }
-    function renderAll() { for (const control of controls) render(control); }
+    function renderAll() {
+      const visible = [...entries.values()].filter(entry => entry.row.isConnected);
+      if (bottom) bottom.complete = Boolean(visible.length && visible.every(entry => entry.video));
+      for (const control of controls) render(control);
+    }
+    function clearPending(text) {
+      for (const task of pending) message(task.control, text);
+      pending.length = 0;
+    }
+    function drain() {
+      if (active || leaving) return;
+      while (pending.length) {
+        const task = pending.shift();
+        task.list = task.list.filter(entry => entry.row.isConnected && !entry.video);
+        if (!task.control.host.isConnected || !task.list.length) continue;
+        void start(task.control, task.mode, task); return;
+      }
+      renderAll();
+    }
     function positionMenu(control) {
       if (!control.audio.open || !control.summary.getBoundingClientRect) return;
       const rect = control.summary.getBoundingClientRect(), viewport = document.documentElement.clientWidth || 1024;
@@ -1893,7 +1917,12 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       control.main.onclick = () => start(control, (batch ? control.complete : entry.video) ? 'resave' : 'video');
       control.summary.onclick = event => { if (active) event.preventDefault(); };
       for (const button of control.audio.querySelectorAll('button')) button.onclick = () => { control.audio.open = false; start(control, button.dataset.format); };
-      control.cancel.onclick = () => { if (active) { active.cancelling = true; active.controller.abort(); renderAll(); } };
+      control.cancel.onclick = () => {
+        const index = pending.findIndex(task => task.control === control);
+        if (index !== -1) { pending.splice(index, 1); message(control, '已取消排队。'); }
+        else if (active) { active.cancelling = true; active.controller.abort(); }
+        renderAll();
+      };
       controls.add(control); render(control); return control;
     }
     function rowTitle(row) {
@@ -1982,6 +2011,10 @@ const require = name => { if (name === './progress-estimate.js') return Progress
       }
       const visible = [...entries.values()].filter(entry => entry.row.isConnected);
       bottom.complete = Boolean(visible.length && visible.every(entry => entry.video));
+      for (let index = pending.length - 1; index >= 0; index--) {
+        const task = pending[index]; task.list = task.list.filter(entry => entry.row.isConnected);
+        if (!task.control.host.isConnected || !task.list.length) pending.splice(index, 1);
+      }
       if (active?.current && !active.current.row.isConnected) { active.cancelling = true; active.controller.abort(); }
       // Also handle sorting/pagination without duplicating buttons or headers.
       renderAll();
@@ -2064,10 +2097,19 @@ const require = name => { if (name === './progress-estimate.js') return Progress
         signal.throwIfAborted(); await sink.close(); committed = true;
       } catch (error) { if (!committed) await rollback(sink, error); throw error; }
     }
-    async function start(control, mode) {
-      if (active) return;
-      const list = selectedEntries(control); if (!list.length) return;
-      const job = active = {control, controller: new AbortController(), request, browserDownload: control.batch, started: performance.now(), current: null, cancelling: false, holds: []};
+    async function start(control, mode, queuedTask) {
+      if (leaving || pending.some(task => task.control === control)) return;
+      const list = queuedTask?.list || (mode === 'video' ? downloadable(control) : selectedEntries(control));
+      if (!list.length) return;
+      if (active) {
+        if (mode !== 'video' || active.control === control) return;
+        // Only metadata is queued; no background player, request or file is
+        // opened until the preceding job has finished its cleanup.
+        pending.push({control, mode, list}); renderAll(); return;
+      }
+      // A queued task no longer has a user activation for a native picker.
+      // Use the existing browser-download path rather than opening it late.
+      const job = active = {control, list, controller: new AbortController(), request, browserDownload: control.batch || Boolean(queuedTask), started: performance.now(), current: null, cancelling: false, holds: []};
       job.batchEstimate = createEstimate(); job.completedBytes = 0;
       const updateEstimates = () => {
         if (job.current) estimate(job.current.control, job.currentEstimate?.read() || {speed:null,remaining:Infinity});
@@ -2124,12 +2166,12 @@ const require = name => { if (name === './progress-estimate.js') return Progress
           job.completedBytes += job.entryBytes;
           if (control.batch) { job.current = null; render(entry.control); }
         }
-        if (control.batch && mode === 'video') control.complete = true;
         message(control, '已完成。');
       } catch (caught) {
         if (caught.name === 'NotFoundError' && job.current) job.current.needsFile = true;
         const error = caught.cleanupFailed ? caught : job.controller.signal.aborted ? job.controller.signal.reason || caught : caught;
         const cancelled = error.name === 'AbortError';
+        if (!cancelled || error.cleanupFailed) clearPending('队列已停止，请重试。');
         const cleanup = error.cleanupFailed ? (error.cleanupRecovery ? '临时文件待清理，页面恢复后重试。' : '撤销写入失败，请检查目标文件。') : '未完成的临时文件已清理。';
         const text = cancelled ? `已取消；${cleanup}` : `${errorMessage(error)} ${cleanup}`;
         message(control, text, !cancelled || error.cleanupFailed); if (job.current) message(job.current.control, text, !cancelled || error.cleanupFailed);
@@ -2137,10 +2179,14 @@ const require = name => { if (name === './progress-estimate.js') return Progress
         clearInterval(job.estimateTimer);
         for (const release of job.holds) try { await release(); } catch (error) { message(control, '临时副本未能继续保留；重存时请选择已保存的视频。', true); }
         void wakeLock?.release().catch(() => {});
-        job.current = null; active = null; onJob(null); renderAll();
+        job.current = null; active = null; onJob(null); renderAll(); drain();
       }
     }
     document.addEventListener('scroll', () => { for (const control of controls) positionMenu(control); }, true);
+    for (const event of ['pagehide', 'beforeunload']) window.addEventListener(event, () => {
+      leaving = true; clearPending('页面已离开，排队已取消。'); active?.controller.abort(); renderAll();
+    });
+    window.addEventListener('pageshow', () => { leaving = false; renderAll(); });
     return {refresh};
   }
   return {create, createEstimate, remainingText};
@@ -2633,7 +2679,7 @@ return module.exports; })();
     const recordDiagnostic = value => {
       diagnostics.push(value);
       if (diagnostics.length > 100) diagnostics.splice(30, diagnostics.length - 100);
-      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.6.3-debug', events: diagnostics}, null, 2);
+      panel.audioDebugText.value = JSON.stringify({script: 'PKU-Replay-Saver', version: '1.6.4-debug', events: diagnostics}, null, 2);
     };
     recordDiagnostic({stage: 'browser', userAgent: navigator.userAgent, selectedFormat: format,
       sandboxAudioDecoder: typeof globalThis.AudioDecoder, pageAudioDecoder: typeof page.AudioDecoder,
